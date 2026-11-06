@@ -1,0 +1,219 @@
+GOAL
+React Nimiq mini app that can: swap (USDT<->NIM), lock USDT, unlock USDT,
+view locked USDT, send (USDT and NIM).
+
+NOTE ON NIM: real NIM lives on the Nimiq chain, not on Sepolia. For testnet we
+use a mock ERC-20 "wNIM" (5 decimals, like NIM). USDT is a mock ERC-20 (6 dec).
+Swap the two token addresses for real ones when moving to mainnet/bridge.
+
+CONTRACTS (files in this folder)
+  MockToken.sol  - test USDT and wNIM (has faucet())
+  USDTlock.sol   - lockUSDT, unlockUSDT, viewLockedUSDT
+  SWAPtoken.sol  - swapUSDTforNIM, swapNIMforUSDT (fixed rate pool)
+  CONDIFI.sol    - sendUSDT, sendNIM
+
+==========================================================
+PART 1: DEPLOY ON REMIX (SEPOLIA TESTNET)
+==========================================================
+1. Install MetaMask, switch to the Sepolia network.
+2. Get free Sepolia ETH from a faucet (e.g. sepoliafaucet.com or
+   Google Cloud Web3 Sepolia faucet).
+3. Open https://remix.ethereum.org, create folder contracts/ and paste the
+   4 .sol files. Imports of @openzeppelin resolve automatically in Remix.
+4. Solidity Compiler tab: version 0.8.20+ -> compile each file.
+5. Deploy & Run tab: Environment = "Injected Provider - MetaMask" (confirm
+   network shows Sepolia).
+6. Deploy IN THIS ORDER, copying each address:
+   a. MockToken  args: "Test USDT","USDT",6     -> USDT_ADDRESS
+   b. MockToken  args: "Wrapped NIM","wNIM",5    -> NIM_ADDRESS
+   c. USDTlock   arg : USDT_ADDRESS              -> LOCK_ADDRESS
+   d. SWAPtoken  args: USDT_ADDRESS, NIM_ADDRESS, 1000000
+        (rate 1e6 = 1 raw NIM unit per raw USDT unit; i.e. 1 USDT -> 0.1 NIM
+         because of decimals 6 vs 5. Change with setRate later.)  -> SWAP_ADDRESS
+   e. CONDIFI    args: USDT_ADDRESS, NIM_ADDRESS -> CONDIFI_ADDRESS
+7. Fund the swap pool (otherwise swaps revert): on both token contracts call
+   transfer(SWAP_ADDRESS, 100000 * 10^decimals).
+   (USDT: 100000000000, wNIM: 10000000000)
+8. Optional: verify contracts on Sepolia Etherscan (Remix "Etherscan -
+   Contract Verification" plugin).
+9. In Remix, copy ABIs (Compiler tab -> ABI button) only if you want the
+   full ABI; the human-readable ABIs in Part 2 are enough.
+
+==========================================================
+PART 2: REACT APP INTEGRATION
+==========================================================
+Install:   npm i ethers
+
+--- src/config.js ---------------------------------------
+export const CHAIN_ID_HEX = "0xaa36a7"; // Sepolia (11155111)
+export const ADDRESSES = {
+  USDT:    "PASTE_USDT_ADDRESS",
+  NIM:     "PASTE_NIM_ADDRESS",
+  LOCK:    "PASTE_LOCK_ADDRESS",
+  SWAP:    "PASTE_SWAP_ADDRESS",
+  CONDIFI: "PASTE_CONDIFI_ADDRESS",
+};
+export const DECIMALS = { USDT: 6, NIM: 5 };
+
+export const ERC20_ABI = [
+  "function approve(address spender,uint256 amount) returns (bool)",
+  "function allowance(address owner,address spender) view returns (uint256)",
+  "function balanceOf(address) view returns (uint256)",
+  "function faucet(uint256 amount)",
+];
+export const LOCK_ABI = [
+  "function lockUSDT(uint256 amount)",
+  "function unlockUSDT(uint256 amount)",
+  "function viewLockedUSDT(address user) view returns (uint256)",
+];
+export const SWAP_ABI = [
+  "function swapUSDTforNIM(uint256 usdtIn)",
+  "function swapNIMforUSDT(uint256 nimIn)",
+  "function quoteUsdtToNim(uint256) view returns (uint256)",
+  "function quoteNimToUsdt(uint256) view returns (uint256)",
+];
+export const CONDIFI_ABI = [
+  "function sendUSDT(address to,uint256 amount)",
+  "function sendNIM(address to,uint256 amount)",
+];
+
+--- src/contracts.js ------------------------------------
+import { BrowserProvider, Contract, parseUnits, formatUnits } from "ethers";
+import { ADDRESSES, DECIMALS, CHAIN_ID_HEX, ERC20_ABI, LOCK_ABI,
+         SWAP_ABI, CONDIFI_ABI } from "./config";
+
+// Nimiq Pay mini apps inject an EVM provider as window.ethereum
+// (check the Nimiq mini-app SDK docs; if it exposes a different object,
+// only change getProvider below).
+function getProvider() {
+  if (!window.ethereum) throw new Error("No wallet provider found");
+  return new BrowserProvider(window.ethereum);
+}
+
+export async function connectWallet() {
+  const provider = getProvider();
+  await provider.send("eth_requestAccounts", []);
+  try {
+    await provider.send("wallet_switchEthereumChain", [{ chainId: CHAIN_ID_HEX }]);
+  } catch (e) { /* wallet may not support switching; ignore */ }
+  const signer = await getProvider().getSigner();
+  return { signer, address: await signer.getAddress() };
+}
+
+async function signer() { return getProvider().getSigner(); }
+const toRaw = (v, t) => parseUnits(String(v), DECIMALS[t]);
+const fromRaw = (v, t) => formatUnits(v, DECIMALS[t]);
+
+async function ensureAllowance(token, spender, amountRaw) {
+  const s = await signer();
+  const c = new Contract(ADDRESSES[token], ERC20_ABI, s);
+  const owner = await s.getAddress();
+  const current = await c.allowance(owner, spender);
+  if (current < amountRaw) {
+    const tx = await c.approve(spender, amountRaw);
+    await tx.wait();
+  }
+}
+
+// ---------- balances ----------
+export async function getBalance(token /* "USDT" | "NIM" */) {
+  const s = await signer();
+  const c = new Contract(ADDRESSES[token], ERC20_ABI, s);
+  return fromRaw(await c.balanceOf(await s.getAddress()), token);
+}
+
+// testnet only: mint yourself tokens
+export async function mintTestTokens(token, amount) {
+  const s = await signer();
+  const c = new Contract(ADDRESSES[token], ERC20_ABI, s);
+  await (await c.faucet(toRaw(amount, token))).wait();
+}
+
+// ---------- LOCK / UNLOCK / VIEW ----------
+export async function lockUSDT(amount) {
+  const raw = toRaw(amount, "USDT");
+  await ensureAllowance("USDT", ADDRESSES.LOCK, raw);
+  const c = new Contract(ADDRESSES.LOCK, LOCK_ABI, await signer());
+  return (await c.lockUSDT(raw)).wait();
+}
+
+export async function unlockUSDT(amount) {
+  const c = new Contract(ADDRESSES.LOCK, LOCK_ABI, await signer());
+  return (await c.unlockUSDT(toRaw(amount, "USDT"))).wait();
+}
+
+export async function viewLockedUSDT() {
+  const s = await signer();
+  const c = new Contract(ADDRESSES.LOCK, LOCK_ABI, s);
+  return fromRaw(await c.viewLockedUSDT(await s.getAddress()), "USDT");
+}
+
+// ---------- SWAP ----------
+export async function quoteSwap(from /* "USDT"|"NIM" */, amount) {
+  const c = new Contract(ADDRESSES.SWAP, SWAP_ABI, await signer());
+  const raw = toRaw(amount, from);
+  if (from === "USDT") return fromRaw(await c.quoteUsdtToNim(raw), "NIM");
+  return fromRaw(await c.quoteNimToUsdt(raw), "USDT");
+}
+
+export async function swapUSDTforNIM(amount) {
+  const raw = toRaw(amount, "USDT");
+  await ensureAllowance("USDT", ADDRESSES.SWAP, raw);
+  const c = new Contract(ADDRESSES.SWAP, SWAP_ABI, await signer());
+  return (await c.swapUSDTforNIM(raw)).wait();
+}
+
+export async function swapNIMforUSDT(amount) {
+  const raw = toRaw(amount, "NIM");
+  await ensureAllowance("NIM", ADDRESSES.SWAP, raw);
+  const c = new Contract(ADDRESSES.SWAP, SWAP_ABI, await signer());
+  return (await c.swapNIMforUSDT(raw)).wait();
+}
+
+// ---------- SEND ----------
+export async function sendUSDT(to, amount) {
+  const raw = toRaw(amount, "USDT");
+  await ensureAllowance("USDT", ADDRESSES.CONDIFI, raw);
+  const c = new Contract(ADDRESSES.CONDIFI, CONDIFI_ABI, await signer());
+  return (await c.sendUSDT(to, raw)).wait();
+}
+
+export async function sendNIM(to, amount) {
+  const raw = toRaw(amount, "NIM");
+  await ensureAllowance("NIM", ADDRESSES.CONDIFI, raw);
+  const c = new Contract(ADDRESSES.CONDIFI, CONDIFI_ABI, await signer());
+  return (await c.sendNIM(to, raw)).wait();
+}
+
+--- example usage in a component ------------------------
+import { connectWallet, lockUSDT, unlockUSDT, viewLockedUSDT,
+         swapUSDTforNIM, sendUSDT } from "./contracts";
+
+function App() {
+  const [addr, setAddr] = useState(); const [locked, setLocked] = useState("0");
+  const refresh = async () => setLocked(await viewLockedUSDT());
+  return (<>
+    <button onClick={async () => setAddr((await connectWallet()).address)}>Connect</button>
+    <button onClick={async () => { await lockUSDT("10"); refresh(); }}>Lock 10 USDT</button>
+    <button onClick={async () => { await unlockUSDT("5"); refresh(); }}>Unlock 5</button>
+    <button onClick={() => swapUSDTforNIM("10")}>Swap 10 USDT -> NIM</button>
+    <p>Locked: {locked} USDT</p>
+  </>);
+}
+
+==========================================================
+PART 3: TEST CHECKLIST
+==========================================================
+[ ] connectWallet shows Sepolia address
+[ ] mintTestTokens("USDT", 1000)  -> balance updates
+[ ] lockUSDT(10) -> viewLockedUSDT = 10
+[ ] unlockUSDT(5) -> viewLockedUSDT = 5
+[ ] quoteSwap + swapUSDTforNIM / swapNIMforUSDT (pool must be funded, step 7)
+[ ] sendUSDT / sendNIM to a second wallet
+[ ] Open the app inside Nimiq Pay (mini app) and repeat
+
+KNOWN LIMITS / NEXT STEPS
+- Real NIM is on Nimiq's own chain: for mainnet you need a bridge/wrapped NIM
+  or use Nimiq's native send API for NIM sends instead of CONDIFI.sendNIM.
+- Swap uses a fixed owner-set rate (no oracle). Fine for testnet only.
+- Contracts are unaudited.

@@ -1,0 +1,23 @@
+i added the utils to lock, send, swap, unlock and view lock functions 
+now i want you to go through the app and replace the dummy function with the real contract interactions. 
+also use real market data in the dashboard screen
+
+
+push to github
+have clude tell u all the places where the data was stored loaclly to write hhtp to save it on backend instead.
+
+generate and verify task
+
+deploy contract
+use frontend to interact with contract
+test it 
+
+
+move from testnet to mainnet
+
+
+git add .
+git commit -m "first commit"
+git branch -M master
+git remote add origin git@github.com:Danicex/condify.git
+git push -u origin master

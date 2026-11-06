@@ -1,0 +1,13 @@
+# Dependencies
+node_modules/
+
+# Environments & Python Virtual Envs
+.env
+.env.*
+*myenv/
+*/myenv/
+
+# Python specific cache/compiled files (for your backend folder)
+__pycache__/
+*.py[cod]
+*$py.class
