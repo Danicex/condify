@@ -24,10 +24,10 @@ const TABS = [
   { id: 'swap', label: 'Swap', icon: RefreshCw, title: 'Token Swap' },
   { id: 'settings', label: 'Settings', icon: Settings, title: 'Settings' },
 ]
-const CONNECTED_FLAG = 'nimlock-connected' // only a flag: Nimiq Pay re-approves silently, so we reconnect on load
+const CONNECTED_FLAG = 'condify-connected' // only a flag: Nimiq Pay re-approves silently, so we reconnect on load
 
 function Flow() {
-  const { wallet, setWallet } = useApp()
+  const { wallet, setWallet, syncError, clearSyncError, reload } = useApp()
   const [step, setStep] = useState(() => {
     try { return localStorage.getItem(CONNECTED_FLAG) ? 'connect' : 'landing' } catch { return 'landing' }
   })
@@ -58,6 +58,14 @@ function Flow() {
         {page === 'dashboard' ? <Logo /> : <h1 className="text-lg font-extrabold tracking-tight">{current.title}</h1>}
         <span className="h-2 w-2 animate-pulse rounded-full bg-success" title="Connected" />
       </header>
+
+      {syncError && (
+        <div className="flex shrink-0 items-start gap-2 bg-destructive/10 px-5 py-2 text-[11px] font-medium text-destructive">
+          <span className="min-w-0 flex-1 break-words">{syncError}</span>
+          <button onClick={reload} className="font-bold underline">Retry</button>
+          <button onClick={clearSyncError} aria-label="Dismiss" className="font-bold">✕</button>
+        </div>
+      )}
 
       <main className="no-scrollbar flex-1 overflow-y-auto px-5 py-5 pb-8">
         {page === 'dashboard' && <Dashboard onNavigate={navigate} />}

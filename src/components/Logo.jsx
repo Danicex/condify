@@ -18,7 +18,7 @@ export function Logo({ className, tone = 'brand' }) {
       <div className={cn('flex h-8 w-8 items-center justify-center rounded-xl', brand ? 'bg-primary text-white' : 'bg-white text-primary')} style={{ '--logo-hole': brand ? 'var(--primary)' : '#fff' }}>
         <LogoMark className="h-5 w-5" />
       </div>
-      <span className={cn('text-lg font-extrabold tracking-tight', !brand && 'text-white')}>Nimlock</span>
+      <span className={cn('text-lg font-extrabold tracking-tight', !brand && 'text-white')}>Condify</span>
     </div>
   )
 }

@@ -1,17 +1,28 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
+import { DAY } from '@/lib/utils'
 import { useBalances } from '@/hooks/useBalances'
 import { lockUSDT, unlockUSDT } from '@/contracts'
+import * as api from '@/lib/api'
 
 /**
  * App state.
- *  - Money movement (lock / unlock) is real: it goes through src/contracts.js.
- *  - The contracts only track a per-user locked USDT total, so goal metadata (name, unlock date,
- *    unlock task), automation rules, activity and stats are kept per wallet in localStorage.
+ *  - Money movement (lock / unlock) goes on-chain via src/contracts.js.
+ *  - Goal metadata, automation rules, activity and task completions live in the FastAPI backend (src/lib/api.js).
+ *    Nothing is persisted in localStorage any more.
  */
 const AppCtx = createContext(null)
 
-const storeKey = (a) => `nimlock:v1:${String(a).toLowerCase()}`
-const readStore = (a) => { try { return JSON.parse(localStorage.getItem(storeKey(a))) || {} } catch { return {} } }
+const dayKey = (ms) => Math.floor(ms / DAY)
+/** Consecutive days with at least one completed task, counting back from today (or yesterday if none today). */
+function streakOf(times) {
+  const days = new Set(times.map(dayKey))
+  let d = dayKey(Date.now())
+  if (!days.has(d)) d -= 1
+  let n = 0
+  while (days.has(d)) { n += 1; d -= 1 }
+  return n
+}
+const errText = (e) => e?.message || 'Request failed'
 
 export function AppProvider({ children }) {
   const [wallet, setWallet] = useState(null) // from connectNimiqPay()
@@ -19,57 +30,108 @@ export function AppProvider({ children }) {
   const [goals, setGoals] = useState([])
   const [conditions, setConditions] = useState([])
   const [activity, setActivity] = useState([])
-  const [stats, setStats] = useState({ tasksDone: 0, streak: 0 })
+  const [taskTimes, setTaskTimes] = useState([]) // completion timestamps (ms)
+  const [loaded, setLoaded] = useState(false)
+  const [syncError, setSyncError] = useState(null) // shown as a banner when the backend is unreachable / a save failed
 
-  // ---- per-wallet persistence ----
   const owner = wallet ? wallet.evmAddress || wallet.address : null
-  const loadedFor = useRef(null)
+
+  // ---- load everything for this user from the backend ----
+  const load = useCallback(async () => {
+    const [g, r, a, t] = await Promise.all([api.listGoals(), api.listRules(), api.listActivity(), api.listTaskCompletions()])
+    setGoals(g); setConditions(r); setActivity(a); setTaskTimes(t.map((x) => x.at))
+  }, [])
+
   useEffect(() => {
-    if (!owner) { loadedFor.current = null; setGoals([]); setConditions([]); setActivity([]); setStats({ tasksDone: 0, streak: 0 }); return }
-    const d = readStore(owner)
-    setGoals(d.goals || []); setConditions(d.conditions || []); setActivity(d.activity || []); setStats(d.stats || { tasksDone: 0, streak: 0 })
-    loadedFor.current = owner
-  }, [owner])
-  useEffect(() => {
-    if (!owner || loadedFor.current !== owner) return
-    try { localStorage.setItem(storeKey(owner), JSON.stringify({ goals, conditions, activity, stats })) } catch { /* ignore */ }
-  }, [owner, goals, conditions, activity, stats])
+    setLoaded(false); setSyncError(null)
+    if (!owner) { api.setAuth(null); setGoals([]); setConditions([]); setActivity([]); setTaskTimes([]); return }
+    api.setAuth({ devAddress: owner }) // swap for { token } when wallet-signature login is added
+    let cancelled = false
+    load()
+      .catch((e) => !cancelled && setSyncError(`Could not load your data: ${errText(e)}`))
+      .finally(() => !cancelled && setLoaded(true))
+    return () => { cancelled = true }
+  }, [owner, load])
+
+  const stats = useMemo(() => ({ tasksDone: taskTimes.length, streak: streakOf(taskTimes) }), [taskTimes])
 
   const goalsRef = useRef(goals)
   goalsRef.current = goals
   const live = !!wallet && !wallet.demo // demo wallet (dev only) skips the chain
 
-  const log = useCallback((kind, text) => setActivity((a) => [{ id: Date.now() + Math.random(), kind, text, at: Date.now() }, ...a].slice(0, 20)), [])
+  /** Add an activity line: shows instantly, then saves to the backend. */
+  const log = useCallback((kind, text, txHash) => {
+    const tempId = `tmp-${Date.now()}-${Math.random()}`
+    setActivity((a) => [{ id: tempId, kind, text, txHash: txHash ?? null, at: Date.now() }, ...a].slice(0, 50))
+    api.createActivity({ kind, text, txHash })
+      .then((row) => setActivity((a) => a.map((x) => (x.id === tempId ? row : x))))
+      .catch((e) => setSyncError(`Could not save activity: ${errText(e)}`))
+  }, [])
 
-  /** Locks USDT on-chain, then records the goal. Throws if the transaction fails. */
+  /** Locks USDT on-chain, then saves the goal. Throws only if the lock transaction itself fails. */
   const addGoal = useCallback(async (g) => {
-    if (live) await lockUSDT(g.amount)
-    setGoals((gs) => [{ id: Date.now(), createdAt: Date.now(), status: 'active', token: 'USDT', ...g }, ...gs])
-    log('lock', `Locked $${Number(g.amount).toLocaleString()} into ${g.name}`)
+    let txHash = null
+    if (live) txHash = (await lockUSDT(g.amount))?.hash ?? null
+    const draft = { token: 'USDT', ...g, txHash }
+    try {
+      const row = await api.createGoal(draft)
+      setGoals((gs) => [row, ...gs])
+    } catch (e) {
+      // funds ARE locked but the record didn't save: keep it visible locally and tell the user
+      setGoals((gs) => [{ id: `local-${Date.now()}`, createdAt: Date.now(), status: 'active', unsynced: true, ...draft }, ...gs])
+      setSyncError(`Funds are locked on-chain but the goal was not saved (${errText(e)}).`)
+    }
+    log('lock', `Locked $${Number(g.amount).toLocaleString()} into ${g.name}`, txHash)
     balances.refresh()
   }, [live, log, balances])
 
-  /** Unlocks the goal's USDT on-chain (after maturity, or after the unlock task), then marks it released. */
+  /** Unlocks the goal's USDT on-chain, then marks it liquidated (and records the task if it was an early release). */
   const liquidateGoal = useCallback(async (id, viaTask) => {
     const g = goalsRef.current.find((x) => x.id === id)
     if (!g) return
     if (live) await unlockUSDT(g.amount)
     setGoals((gs) => gs.map((x) => (x.id === id ? { ...x, status: 'liquidated', liquidatedAt: Date.now() } : x)))
     log('unlock', `Liquidated ${g.name} · $${Number(g.amount).toLocaleString()} released`)
-    if (viaTask) setStats((s) => ({ tasksDone: s.tasksDone + 1, streak: s.streak + 1 }))
+    if (!g.unsynced) {
+      api.markGoalLiquidated(id).catch((e) => setSyncError(`Funds released, but the goal status was not saved: ${errText(e)}`))
+    }
+    if (viaTask) {
+      setTaskTimes((t) => [...t, Date.now()])
+      api.recordTaskCompletion({ taskId: g.taskId, goalId: g.unsynced ? null : id })
+        .catch((e) => setSyncError(`Could not save task completion: ${errText(e)}`))
+    }
     balances.refresh()
   }, [live, log, balances])
 
-  const addCondition = useCallback((c) => {
-    setConditions((cs) => [{ id: Date.now(), enabled: true, ...c }, ...cs])
+  /** Saves a rule. Throws if the backend rejects it. */
+  const addCondition = useCallback(async (c) => {
+    const row = await api.createRule({ enabled: true, ...c })
+    setConditions((cs) => [row, ...cs])
     log('rule', `Rule “${c.title}” armed`)
   }, [log])
-  const toggleCondition = useCallback((id) => setConditions((cs) => cs.map((c) => (c.id === id ? { ...c, enabled: !c.enabled } : c))), [])
-  const removeCondition = useCallback((id) => setConditions((cs) => cs.filter((c) => c.id !== id)), [])
+
+  const toggleCondition = useCallback((id) => {
+    const cur = conditions.find((c) => c.id === id)
+    if (!cur) return
+    setConditions((cs) => cs.map((c) => (c.id === id ? { ...c, enabled: !c.enabled } : c))) // optimistic
+    api.setRuleEnabled(id, !cur.enabled).catch((e) => {
+      setConditions((cs) => cs.map((c) => (c.id === id ? { ...c, enabled: cur.enabled } : c))) // revert
+      setSyncError(`Could not update rule: ${errText(e)}`)
+    })
+  }, [conditions])
+
+  const removeCondition = useCallback((id) => {
+    const prev = conditions
+    setConditions((cs) => cs.filter((c) => c.id !== id)) // optimistic
+    api.deleteRule(id).catch((e) => {
+      setConditions(prev) // revert
+      setSyncError(`Could not delete rule: ${errText(e)}`)
+    })
+  }, [conditions])
 
   const value = useMemo(
-    () => ({ wallet, setWallet, live, balances, goals, addGoal, liquidateGoal, conditions, addCondition, toggleCondition, removeCondition, activity, log, stats }),
-    [wallet, live, balances, goals, addGoal, liquidateGoal, conditions, addCondition, toggleCondition, removeCondition, activity, log, stats],
+    () => ({ wallet, setWallet, live, balances, goals, addGoal, liquidateGoal, conditions, addCondition, toggleCondition, removeCondition, activity, log, stats, loaded, syncError, clearSyncError: () => setSyncError(null), reload: () => load().then(() => setSyncError(null)).catch((e) => setSyncError(errText(e))) }),
+    [wallet, live, balances, goals, addGoal, liquidateGoal, conditions, addCondition, toggleCondition, removeCondition, activity, log, stats, loaded, syncError, load],
   )
   return <AppCtx.Provider value={value}>{children}</AppCtx.Provider>
 }

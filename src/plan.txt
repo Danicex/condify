@@ -15,9 +15,7 @@ test it
 
 move from testnet to mainnet
 
-
-git add .
-git commit -m "first commit"
-git branch -M master
-git remote add origin git@github.com:Danicex/condify.git
-git push -u origin master
+give me a scope of what i am doing with the contract, correct me if i am wrong. 
+- mocktoken contract create mock token, when deployed i can call the approve, balance of, allowance functions. i need to do this before deploying others. it holds the money i need to run the other contracts
+- after i ran deployed moctoken i was given an address is it this adress i will pass to usdtlock? and swap? 
+also i have to deploy usdtlock and swap to call the fucntions 

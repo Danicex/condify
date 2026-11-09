@@ -46,6 +46,8 @@ export default function ConditionWealthView() {
   const [act, setAct] = useState('swap')
   const [amount, setAmount] = useState('')
   const [target, setTarget] = useState('NIM')
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState('')
 
   const jsonError = useMemo(() => {
     if (type !== 'api' || !body.trim()) return null
@@ -69,16 +71,24 @@ export default function ConditionWealthView() {
     (type === 'time' && when) || (type === 'api' && url && path && value && !jsonError) || (type === 'location' && place && lat && lng)
   )
 
-  const submit = (e) => {
+  const submit = async (e) => {
     e.preventDefault()
-    if (!ready) return
+    if (!ready || saving) return
     const rule =
       type === 'time' ? { title: `On ${new Date(when).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}`, detail: repeat === 'once' ? 'One time' : `Repeats ${repeat}` }
       : type === 'api' ? { title: `${path} ${op} ${value}`, detail: `${method} ${url.replace(/^https?:\/\//, '').slice(0, 40)}…` }
       : { title: `${edge === 'enter' ? 'Arrives at' : 'Leaves'} ${place}`, detail: `${radius} m radius · ${lat}, ${lng}` }
-    addCondition({ type, ...rule, action: actionText, config: { when, repeat, url, method, body, path, op, value, place, lat, lng, radius, edge, act, amount, target } })
-    haptic.success()
-    setAmount('')
+    setSaving(true); setSaveError('')
+    try {
+      await addCondition({ type, ...rule, action: actionText, config: { when, repeat, url, method, body, path, op, value, place, lat, lng, radius, edge, act, amount, target } })
+      haptic.success()
+      setAmount('')
+    } catch (err) {
+      haptic.error()
+      setSaveError(err?.message || 'Could not save rule')
+    } finally {
+      setSaving(false)
+    }
   }
 
   return (
@@ -153,7 +163,8 @@ export default function ConditionWealthView() {
             </div>
           </div>
 
-          <Button type="submit" variant="secondary" size="lg" className="w-full" disabled={!ready}>Deploy rule</Button>
+          {saveError && <p className="break-words text-center text-xs font-medium text-destructive">{saveError}</p>}
+          <Button type="submit" variant="secondary" size="lg" className="w-full" disabled={!ready || saving}>{saving ? 'Saving…' : 'Deploy rule'}</Button>
         </Card>
       </form>
 

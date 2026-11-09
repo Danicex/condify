@@ -27,7 +27,7 @@ export default function SettingsView({ onLogout }) {
   const { theme, setTheme, resolved } = useTheme()
   const { wallet, balances } = useApp()
   const { user, isTelegram } = useTelegram()
-  const name = user ? [user.first_name, user.last_name].filter(Boolean).join(' ') : 'Nimlock user'
+  const name = user ? [user.first_name, user.last_name].filter(Boolean).join(' ') : 'Condify user'
 
   return (
     <div className="animate-fade-in space-y-5">
@@ -105,7 +105,7 @@ export default function SettingsView({ onLogout }) {
       </Card>
 
       <Button variant="destructive" size="lg" className="w-full" onClick={onLogout}><LogOut size={16} /> Disconnect wallet</Button>
-      <p className="text-center text-[10px] font-medium text-muted-foreground">Nimlock v0.1.0</p>
+      <p className="text-center text-[10px] font-medium text-muted-foreground">Condify v0.1.0</p>
     </div>
   )
 }
