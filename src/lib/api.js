@@ -51,3 +51,5 @@ export const createActivity = async ({ kind, text, txHash }) => activityIn(await
 // ---- task completions (drives the "tasks done" and "streak" stats) ----
 export const listTaskCompletions = async () => (await request('GET', '/tasks?limit=500')).map(taskIn)
 export const recordTaskCompletion = async ({ taskId, goalId }) => taskIn(await request('POST', '/tasks', { task_id: taskId, goal_id: goalId ?? null }))
+//sign user
+export const signUserToBackend = (r) => request('POST', '/signup', r)

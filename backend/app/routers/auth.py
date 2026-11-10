@@ -141,7 +141,8 @@ def _consume_challenge(session: SessionDep, address: str, signature: str) -> Non
 
 # ───────────────────────────── create user / login ─────────────────────────────
 class CreateUser(BaseModel):
-    addrs: str  # wallet (EVM) address
+    evm_addrs: str  # wallet (EVM) address
+    nim_addrs: str 
     username: Username
     signature: Signature  # signature of the message from GET /auth/nonce
     nim_address: Optional[str] = None
@@ -159,7 +160,7 @@ class AuthOut(BaseModel):
 
 @router.post("/create_user", response_model=AuthOut, status_code=201)
 def create_user(payload: CreateUser, session: SessionDep):
-    addr = _norm(payload.addrs)
+    addr = _norm(payload.evm_addrs)
     if session.exec(select(User).where(User.address == addr)).first():
         raise HTTPException(409, "this wallet already has an account, use /auth/login")
     if session.exec(select(User).where(User.username == payload.username)).first():

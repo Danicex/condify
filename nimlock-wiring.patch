@@ -1,0 +1,3084 @@
+diff --git a/.env.example b/.env.example
+new file mode 100644
+index 0000000..0d78c3b
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,3 @@
++# Copy to .env (frontend, Vite). Only VITE_* values are exposed to the browser: never put secrets here.
++VITE_API_URL=http://localhost:8000
++VITE_LOCK_ADDRESS=          # the deployed USDTlock (new contract: redeploy it, the old address will not work)
+diff --git a/.gitignore b/.gitignore
+index ce68e1b..b3a2558 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -11,3 +11,13 @@ node_modules/
+ __pycache__/
+ *.py[cod]
+ *$py.class
++
++# Local databases (dev data, never commit)
++*.db
++
++# keep the env templates, ignore real env files
++!.env.example
++
++# build output / e2e artifacts
++dist/
++backend/e2e/compiled.json
+diff --git a/backend/.env.example b/backend/.env.example
+new file mode 100644
+index 0000000..675c7a5
+--- /dev/null
++++ b/backend/.env.example
+@@ -0,0 +1,27 @@
++# Copy to backend/.env and fill in. Never commit the real file. Load it however you run the app
++# (e.g. `set -a; source .env; set +a; uvicorn app.main:app --reload`).
++
++# ── auth ──
++JWT_SECRET=                 # required. openssl rand -hex 32
++JWT_TTL_HOURS=24
++AUTH_DOMAIN=nimlock         # shown in the sign-in message
++CORS_ORIGINS=http://localhost:5173
++# AUTH_DEV_MODE=1           # LOCAL ONLY: accepts an X-Dev-Address header instead of a signed login. Never set in production.
++
++# ── database ──
++DATABASE_URL=sqlite:///./nimlock.db     # use postgresql+psycopg://... in production
++
++# ── AI tasks ──
++OPENAI_API_KEY=
++OPENAI_MODEL=gpt-4o                     # must accept images (photo/video proof)
++OPENAI_TRANSCRIBE_MODEL=whisper-1
++PASS_SCORE=0.7
++
++# ── chain (backend talks to the lock contract) ──
++RPC_URL=                                # Sepolia / Polygon JSON-RPC URL
++LOCK_CONTRACT_ADDRESS=                  # the deployed USDTlock
++UNLOCK_SIGNER_KEY=                      # private key whose ADDRESS you passed to USDTlock as trustedSigner (0x...)
++RELAYER_PRIVATE_KEY=                    # wallet that pays gas for early releases. Fund it with ETH (Sepolia) / POL (Polygon).
++                                        # Use a different key from the signer in production.
++# CHAIN_ID=                             # optional, read from RPC_URL when unset
++# TX_TIMEOUT=90
+diff --git a/backend/app/chain.py b/backend/app/chain.py
+new file mode 100644
+index 0000000..67378dd
+--- /dev/null
++++ b/backend/app/chain.py
+@@ -0,0 +1,153 @@
++"""
++Backend <-> USDTlock contract (web3.py). This is where the server talks to the chain directly.
++
++  get_goal()       read a goal from the contract (the on-chain amount / unlock time / released flag are the source of truth)
++  relay_unlock()   submit the "task key" to unlockWithKey() from the relayer wallet. The relayer pays the gas, and the
++                   contract always pays the funds to the goal's owner, so the relayer can never redirect money.
++
++Env:
++  RPC_URL                  JSON-RPC endpoint of the chain the lock contract is on (Sepolia now, Polygon later)
++  LOCK_CONTRACT_ADDRESS    deployed USDTlock
++  RELAYER_PRIVATE_KEY      wallet that pays gas for relayed releases. Defaults to UNLOCK_SIGNER_KEY; use a separate,
++                           low-balance key in production so the signing key never needs ETH/POL.
++  CHAIN_ID                 optional, read from the node when unset
++  TX_TIMEOUT               seconds to wait for the release receipt (default 90)
++"""
++import os
++import threading
++from typing import Optional
++
++from eth_utils import to_checksum_address
++
++from app.errors import ApiError
++
++LOCK_ABI = [
++    {
++        "type": "function", "name": "getGoal", "stateMutability": "view",
++        "inputs": [{"name": "user", "type": "address"}, {"name": "goalId", "type": "uint256"}],
++        "outputs": [{"name": "amount", "type": "uint256"}, {"name": "unlockAt", "type": "uint256"}, {"name": "released", "type": "bool"}],
++    },
++    {
++        "type": "function", "name": "unlockWithKey", "stateMutability": "nonpayable",
++        "inputs": [
++            {"name": "user", "type": "address"}, {"name": "goalId", "type": "uint256"}, {"name": "nonce", "type": "bytes32"},
++            {"name": "expiry", "type": "uint256"}, {"name": "signature", "type": "bytes"},
++        ],
++        "outputs": [],
++    },
++]
++
++_send_lock = threading.Lock()  # one relayed tx at a time, so the relayer's nonce never collides
++_w3 = None  # cached Web3 (tests inject one with set_web3)
++
++
++def set_web3(w3) -> None:
++    """Tests only: use an in-memory chain instead of RPC_URL."""
++    global _w3
++    _w3 = w3
++
++
++def configured() -> bool:
++    return bool(os.getenv("LOCK_CONTRACT_ADDRESS")) and (_w3 is not None or bool(os.getenv("RPC_URL")))
++
++
++def _web3():
++    global _w3
++    if _w3 is None:
++        url = os.getenv("RPC_URL")
++        if not url:
++            raise ApiError(503, "chain access is not configured on the server (RPC_URL)")
++        from web3 import Web3
++        _w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 20}))
++    return _w3
++
++
++def _contract():
++    addr = os.getenv("LOCK_CONTRACT_ADDRESS")
++    if not addr:
++        raise ApiError(503, "chain access is not configured on the server (LOCK_CONTRACT_ADDRESS)")
++    return _web3().eth.contract(address=to_checksum_address(addr), abi=LOCK_ABI)
++
++
++def chain_id() -> int:
++    env = os.getenv("CHAIN_ID")
++    if env:
++        return int(env)
++    try:
++        return int(_web3().eth.chain_id)
++    except ApiError:
++        raise
++    except Exception as e:
++        raise ApiError(503, f"could not reach the chain: {type(e).__name__}") from e
++
++
++def get_goal(user_address: str, goal_id: int) -> dict:
++    """{amount: int (raw token units), unlock_at: int (unix s), released: bool}. amount == 0 means no such lock."""
++    try:
++        amount, unlock_at, released = _contract().functions.getGoal(to_checksum_address(user_address), int(goal_id)).call()
++    except ApiError:
++        raise
++    except Exception as e:
++        raise ApiError(503, f"could not read the lock contract: {type(e).__name__}") from e
++    return {"amount": int(amount), "unlock_at": int(unlock_at), "released": bool(released)}
++
++
++def _relayer_key() -> str:
++    key = os.getenv("RELAYER_PRIVATE_KEY") or os.getenv("UNLOCK_SIGNER_KEY")
++    if not key:
++        raise ApiError(503, "no relayer wallet configured on the server (RELAYER_PRIVATE_KEY)")
++    return key
++
++
++def relayer_address() -> str:
++    from eth_account import Account
++    return Account.from_key(_relayer_key()).address
++
++
++def relay_unlock(user_address: str, goal_id: int, nonce_hex: str, expiry: int, signature: str) -> Optional[str]:
++    """
++    Send unlockWithKey(user, goalId, nonce, expiry, signature) and wait for it to be mined.
++    Returns the tx hash, or None when the goal was already released on-chain (idempotent: nothing to send).
++    Raises ApiError when the chain is unreachable, the relayer is unfunded, or the contract rejects the key.
++    """
++    w3 = _web3()
++    contract = _contract()
++    user = to_checksum_address(user_address)
++
++    state = get_goal(user, goal_id)
++    if state["amount"] == 0:
++        raise ApiError(409, "this goal has no lock on-chain")
++    if state["released"]:
++        return None
++
++    from eth_account import Account
++    acct = Account.from_key(_relayer_key())
++    nonce_bytes = bytes.fromhex(nonce_hex.removeprefix("0x"))
++    sig_bytes = bytes.fromhex(signature.removeprefix("0x"))
++    fn = contract.functions.unlockWithKey(user, int(goal_id), nonce_bytes, int(expiry), sig_bytes)
++
++    with _send_lock:
++        try:
++            tx = fn.build_transaction({
++                "from": acct.address,
++                "nonce": w3.eth.get_transaction_count(acct.address, "pending"),
++                "chainId": chain_id(),
++                "gasPrice": int(w3.eth.gas_price * 1.2),  # estimates gas too; a contract revert surfaces right here
++            })
++            signed = acct.sign_transaction(tx)
++            raw = getattr(signed, "raw_transaction", None) or signed.rawTransaction  # web3 v7+ / v6
++            tx_hash = w3.eth.send_raw_transaction(raw)
++        except Exception as e:
++            msg = str(e)
++            if "insufficient funds" in msg.lower():
++                raise ApiError(503, "the relayer wallet is out of gas funds, top it up and retry") from e
++            raise ApiError(502, f"release was not sent: {msg[:200]}") from e
++
++        try:
++            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=int(os.getenv("TX_TIMEOUT", "90")))
++        except Exception as e:
++            raise ApiError(504, "release sent but not confirmed yet, retry in a minute (it is safe to retry)") from e
++
++    if receipt["status"] != 1:
++        raise ApiError(502, "the contract rejected the release")
++    return tx_hash.hex() if tx_hash.hex().startswith("0x") else "0x" + tx_hash.hex()
+diff --git a/backend/app/crud.py b/backend/app/crud.py
+index 5c44453..106d3a3 100644
+--- a/backend/app/crud.py
++++ b/backend/app/crud.py
+@@ -67,21 +67,21 @@ def read_data(obj_name: str, session: SessionDep, user_id: int, limit: int = 100
+     ).all()
+ 
+ 
+-def create_data(obj_name: str, data_obj, session: SessionDep, user_id: Optional[int] = None):
++def create_data(obj_name: str, data_obj, session: SessionDep, user_id: int):
+     """
+     Create a record owned by user_id. Returns (ok, instance).
+     user_id is always set here, any user_id in the payload is ignored.
++    (User rows are not created here: a User is the owner, not owned. See routers/auth.py.)
+     """
+     model_class = obj_map.get(obj_name.lower())
+     if not model_class:
+         return False, None
+-    
+-    if user_id:
+-        values = _dump(data_obj)
+-        values.pop("id", None)
+-        values["user_id"] = user_id
+-        if not _refs_ok(values, session, user_id):
+-            return False, None
++
++    values = _dump(data_obj)
++    values.pop("id", None)
++    values["user_id"] = user_id
++    if not _refs_ok(values, session, user_id):
++        return False, None
+ 
+     instance = model_class(**values)
+     session.add(instance)
+diff --git a/backend/app/deps.py b/backend/app/deps.py
+index b014f61..9fe69e1 100644
+--- a/backend/app/deps.py
++++ b/backend/app/deps.py
+@@ -1,31 +1,5 @@
+ """
+-Current-user dependency. Every data route depends on this, so ownership is always the *authenticated* user.
+-
+-AUTH IS NOT BUILT YET (wallet-signature login is next). Until then this accepts an `X-Dev-Address`
+-header, and ONLY when AUTH_DEV_MODE=1. With it unset every request gets 401, so this cannot ship open by accident.
+-When SIWE/JWT lands, replace the body of get_current_user: read the verified address from the token. Nothing else changes.
++Current-user dependency. The real implementation lives in routers/auth.py (Bearer JWT from the wallet-signature login,
++plus an X-Dev-Address header only when AUTH_DEV_MODE=1). Re-exported here so routers can keep importing it from app.deps.
+ """
+-import os
+-from typing import Annotated
+-
+-from fastapi import Depends, Header, HTTPException
+-from sqlmodel import select
+-
+-from app.database import SessionDep
+-from app.model import User
+-
+-
+-def get_current_user(session: SessionDep, x_dev_address: Annotated[str | None, Header()] = None) -> User:
+-    if os.getenv("AUTH_DEV_MODE") != "1" or not x_dev_address:
+-        raise HTTPException(status_code=401, detail="Not authenticated")
+-    address = x_dev_address.strip().lower()
+-    user = session.exec(select(User).where(User.address == address)).first()
+-    if not user:
+-        user = User(address=address)
+-        session.add(user)
+-        session.commit()
+-        session.refresh(user)
+-    return user
+-
+-
+-CurrentUser = Annotated[User, Depends(get_current_user)]
++from app.routers.auth import CurrentUser, get_current_user  # noqa: F401
+diff --git a/backend/app/errors.py b/backend/app/errors.py
+new file mode 100644
+index 0000000..4d1cc3d
+--- /dev/null
++++ b/backend/app/errors.py
+@@ -0,0 +1,8 @@
++"""One expected-failure type for the whole API: main.py turns it into {"detail": message} with the given status."""
++
++
++class ApiError(Exception):
++    def __init__(self, status_code: int, message: str):
++        super().__init__(message)
++        self.status_code = status_code
++        self.message = message
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 655faf1..3bb3088 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -2,12 +2,15 @@ from contextlib import asynccontextmanager
+ 
+ import os
+ 
+-from fastapi import FastAPI
++from fastapi import FastAPI, Request
+ from fastapi.middleware.cors import CORSMiddleware
++from fastapi.responses import JSONResponse
+ 
+ from app.database import init_db
+ from app.deps import CurrentUser
++from app.errors import ApiError
+ from app.model import UserRead
++from app.routers import auth, goals, tasks
+ from app.routers.data import routers
+ 
+ 
+@@ -26,6 +29,15 @@ app.add_middleware(
+     allow_headers=["*"],
+ )
+ 
++
++@app.exception_handler(ApiError)
++async def api_error_handler(_: Request, exc: ApiError):
++    return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
++
++
++app.include_router(auth.router)
++app.include_router(goals.router)
++app.include_router(tasks.router)
+ for r in routers:
+     app.include_router(r)
+ 
+diff --git a/backend/app/model.py b/backend/app/model.py
+index a1f51fe..ff2f1da 100644
+--- a/backend/app/model.py
++++ b/backend/app/model.py
+@@ -1,5 +1,5 @@
+ """
+-SQLModel schema. Every table except `User` carries a `user_id` foreign key: each row belongs to exactly one user.
++SQLModel schema. Every table except `User` and `AuthNonce` carries a `user_id` foreign key: each row belongs to exactly one user.
+ 
+ Per resource we have:
+   <X>Base    shared client-editable fields
+@@ -7,6 +7,9 @@ Per resource we have:
+   <X>Create  request body for POST   (never contains user_id: it comes from the auth'd user)
+   <X>Update  request body for PATCH  (all optional)
+   <X>Read    response body
++
++Money lives on-chain (USDTlock). Rows here are metadata. Fields that mirror the chain (status, amount_raw, tx hashes) are
++only ever written by the server after it has read the contract, never taken from a request body.
+ """
+ from datetime import datetime, timezone
+ from typing import Annotated, Any, Optional
+@@ -19,45 +22,68 @@ from sqlmodel import Field, SQLModel
+ 
+ # string enums, validated on request bodies (pydantic constraints work across SQLModel versions)
+ Token = Annotated[str, StringConstraints(pattern=r"^(USDT|NIM)$")]
+-GoalStatus = Annotated[str, StringConstraints(pattern=r"^(active|liquidated)$")]
++TaskCategory = Annotated[str, StringConstraints(pattern=r"^(brain_teaser|brain_memory|fitness_health|mindfulness|finance_iq)$")]
++Difficulty = Annotated[str, StringConstraints(pattern=r"^(easy|medium|hard)$")]
+ RuleType = Annotated[str, StringConstraints(pattern=r"^(time|api|location)$")]
+ ActivityKind = Annotated[str, StringConstraints(pattern=r"^(lock|unlock|swap|send|task|rule)$")]
+ 
++# Goal.status:  pending (row created, lock tx not confirmed yet) -> active (lock found on-chain) -> liquidated (released)
++
+ 
+ def utcnow() -> datetime:
+     return datetime.now(timezone.utc)
+ 
+ 
++def as_utc(dt: Optional[datetime]) -> Optional[datetime]:
++    """SQLite hands datetimes back naive. Everything we store is UTC, so re-attach the zone before comparing or serialising."""
++    if dt is None:
++        return None
++    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
++
++
+ # ───────────────────────────── User ─────────────────────────────
+ class User(SQLModel, table=True):
+     id: Optional[int] = Field(default=None, primary_key=True)
+     address: str = Field(index=True, unique=True)  # lowercase 0x… EVM address (wallet identity)
+-    nim_address: Optional[str] = None  # Nimiq account, optional
++    username: Optional[str] = Field(default=None, index=True, unique=True)
++    nim_address: Optional[str] = None  # Nimiq account as reported by the client. NOT verified, never use it for access control.
+     created_at: datetime = Field(default_factory=utcnow)
+ 
+ 
+ class UserRead(SQLModel):
+     id: int
+     address: str
++    username: Optional[str] = None
+     nim_address: Optional[str] = None
+     created_at: datetime
+ 
+ 
++# ───────────────────────────── Sign-in challenge ─────────────────────────────
++class AuthNonce(SQLModel, table=True):
++    address: str = Field(primary_key=True)  # one pending challenge per wallet
++    nonce: str
++    message: str  # the exact text the wallet must sign
++    expires_at: datetime
++
++
+ # ───────────────────────────── Goal ─────────────────────────────
+-# Metadata for a USDT lock. The funds themselves live in the lock contract; `tx_hash` links to the lock tx.
++# Metadata for a USDT lock. The funds live in the lock contract under (owner address, goal id = this row's id).
+ class GoalBase(SQLModel):
+     name: str = Field(min_length=1, max_length=120)
+     amount: float = Field(gt=0)
+     token: Token = "USDT"
+     unlock_at: AwareDatetime  # must carry a timezone, e.g. new Date().toISOString()
+-    task_id: str  # id from the frontend's data/task.js
+-    status: GoalStatus = "active"
+-    tx_hash: Optional[str] = None
++    task_category: TaskCategory  # which kind of AI task unlocks this goal early
++    task_difficulty: Difficulty = "medium"
+ 
+ 
+ class Goal(GoalBase, table=True):
+     id: Optional[int] = Field(default=None, primary_key=True)
+     user_id: int = Field(foreign_key="user.id", index=True)
++    status: str = Field(default="pending", index=True)
++    tx_hash: Optional[str] = None  # lock tx
++    release_tx_hash: Optional[str] = None  # early-release tx sent by the backend relayer
++    amount_raw: Optional[str] = None  # on-chain amount in token units (string: can exceed 2^53). Copied from the contract at confirm.
+     created_at: datetime = Field(default_factory=utcnow)
+     liquidated_at: Optional[datetime] = None
+ 
+@@ -68,15 +94,13 @@ class GoalCreate(GoalBase):
+ 
+ class GoalUpdate(SQLModel):
+     name: Optional[str] = Field(default=None, min_length=1, max_length=120)
+-    unlock_at: Optional[AwareDatetime] = None
+-    task_id: Optional[str] = None
+-    status: Optional[GoalStatus] = None
+-    tx_hash: Optional[str] = None
+-    liquidated_at: Optional[AwareDatetime] = None
+ 
+ 
+ class GoalRead(GoalBase):
+     id: int
++    status: str
++    tx_hash: Optional[str] = None
++    release_tx_hash: Optional[str] = None
+     created_at: datetime
+     liquidated_at: Optional[datetime] = None
+ 
+@@ -145,19 +169,33 @@ class ActivityRead(ActivityBase):
+     created_at: datetime
+ 
+ 
+-# ───────────────────────────── Task (provisional) ─────────────────────────────
+-# Task *definitions* stay in the frontend (data/task.js). This table only records that a user completed one.
+-# Kept deliberately small until the task design is settled.
++# ───────────────────────────── Task (AI-generated unlock task) ─────────────────────────────
++# One row per generated task. status: pending -> passed | failed. Created and graded only by the server (task_ai.py),
++# so TaskCreate / TaskUpdate are internal and are NOT exposed as request bodies. TaskRead hides the answer key,
++# the rubric and the unlock nonce.
+ class TaskBase(SQLModel):
+-    task_id: str
+-    goal_id: Optional[int] = Field(default=None, foreign_key="goal.id", index=True)
+-    score: Optional[float] = None
++    goal_id: int = Field(foreign_key="goal.id", index=True)
++    category: str
++    difficulty: str
++    title: str
++    description: str
++    submission_type: str  # text | image | audio | video
++    answer_key: str = ""  # hidden from the client
++    rubric: str = ""  # hidden from the client
+ 
+ 
+ class Task(TaskBase, table=True):
+     id: Optional[int] = Field(default=None, primary_key=True)
+     user_id: int = Field(foreign_key="user.id", index=True)
+-    completed_at: datetime = Field(default_factory=utcnow)
++    status: str = Field(default="pending", index=True)
++    attempts: int = 0
++    max_attempts: int = 3
++    score: Optional[float] = None
++    feedback: Optional[str] = None
++    unlock_nonce: Optional[str] = None  # fixed per task, so a task can only ever release once
++    unlock_expires_at: Optional[datetime] = None
++    created_at: datetime = Field(default_factory=utcnow)
++    completed_at: Optional[datetime] = None
+ 
+ 
+ class TaskCreate(TaskBase):
+@@ -165,9 +203,27 @@ class TaskCreate(TaskBase):
+ 
+ 
+ class TaskUpdate(SQLModel):
++    status: Optional[str] = None
++    attempts: Optional[int] = None
+     score: Optional[float] = None
++    feedback: Optional[str] = None
++    unlock_nonce: Optional[str] = None
++    unlock_expires_at: Optional[datetime] = None
++    completed_at: Optional[datetime] = None
+ 
+ 
+-class TaskRead(TaskBase):
++class TaskRead(SQLModel):
+     id: int
+-    completed_at: datetime
++    goal_id: int
++    category: str
++    difficulty: str
++    title: str
++    description: str
++    submission_type: str
++    status: str
++    attempts: int
++    max_attempts: int
++    score: Optional[float] = None
++    feedback: Optional[str] = None
++    created_at: datetime
++    completed_at: Optional[datetime] = None
+diff --git a/backend/app/routers/auth.py b/backend/app/routers/auth.py
+index 2bc38ac..7ee1428 100644
+--- a/backend/app/routers/auth.py
++++ b/backend/app/routers/auth.py
+@@ -5,6 +5,7 @@ Wallet-signature login (Sign-In-with-Ethereum style). No passwords: the user pro
+   2. wallet signs it (personal_sign / ethers signer.signMessage(message))
+   3. POST /auth/create_user  {address, username, signature}   first time: verifies the signature, creates the user, returns a JWT
+      POST /auth/login        {address, signature}             returning user: verifies the signature, returns a JWT
++     (login answers 404 for an unknown wallet WITHOUT burning the nonce, so the same signature can be sent to create_user)
+   4. every other route sends  Authorization: Bearer <jwt>   and depends on CurrentUser (get_current_user below)
+ 
+ Env:
+@@ -26,7 +27,7 @@ from pydantic import BaseModel, StringConstraints
+ from sqlmodel import select
+ 
+ from app.database import SessionDep
+-from app.model import AuthNonce, User, UserRead, utcnow
++from app.model import AuthNonce, User, UserRead, as_utc, utcnow
+ from app.wallet import normalize_address, verify_signed_message
+ 
+ router = APIRouter(prefix="/auth", tags=["auth"])
+@@ -111,6 +112,9 @@ class NonceOut(BaseModel):
+ def get_nonce(session: SessionDep, address: str = Query(...)):
+     addr = _norm(address)
+     now = utcnow()
++    existing = session.get(AuthNonce, addr)
++    if existing and as_utc(existing.expires_at) > now + timedelta(seconds=30):  # still valid: hand out the same one
++        return NonceOut(address=addr, nonce=existing.nonce, message=existing.message, expires_at=as_utc(existing.expires_at).isoformat())
+     nonce = secrets.token_hex(16)
+     expires = now + NONCE_TTL
+     message = (
+@@ -118,8 +122,8 @@ def get_nonce(session: SessionDep, address: str = Query(...)):
+         f"Address: {addr}\nNonce: {nonce}\nIssued At: {now.isoformat()}\nExpires At: {expires.isoformat()}\n\n"
+         "This only proves you own the address. It does not move any funds."
+     )
+-    row = session.get(AuthNonce, addr)
+-    if row:  # one pending challenge per address: a new request replaces the old one
++    row = existing
++    if row:  # expired (or about to): replace it
+         row.nonce, row.message, row.expires_at = nonce, message, expires
+     else:
+         row = AuthNonce(address=addr, nonce=nonce, message=message, expires_at=expires)
+@@ -131,7 +135,7 @@ def get_nonce(session: SessionDep, address: str = Query(...)):
+ def _consume_challenge(session: SessionDep, address: str, signature: str) -> None:
+     """Checks the signature against the stored challenge, then burns the nonce (single use). Raises 401 on any failure."""
+     row = session.get(AuthNonce, address)
+-    if not row or row.expires_at <= utcnow():
++    if not row or as_utc(row.expires_at) <= utcnow():
+         raise HTTPException(401, "no valid challenge for this address, request a new nonce")
+     if not verify_signed_message(address, row.message, signature):
+         raise HTTPException(401, "invalid signature for this address")
+@@ -141,14 +145,14 @@ def _consume_challenge(session: SessionDep, address: str, signature: str) -> Non
+ 
+ # ───────────────────────────── create user / login ─────────────────────────────
+ class CreateUser(BaseModel):
+-    addrs: str  # wallet (EVM) address
++    address: str  # wallet (EVM) address
+     username: Username
+     signature: Signature  # signature of the message from GET /auth/nonce
+     nim_address: Optional[str] = None
+ 
+ 
+ class Login(BaseModel):
+-    addrs: str
++    address: str
+     signature: Signature
+ 
+ 
+@@ -159,7 +163,7 @@ class AuthOut(BaseModel):
+ 
+ @router.post("/create_user", response_model=AuthOut, status_code=201)
+ def create_user(payload: CreateUser, session: SessionDep):
+-    addr = _norm(payload.addrs)
++    addr = _norm(payload.address)
+     if session.exec(select(User).where(User.address == addr)).first():
+         raise HTTPException(409, "this wallet already has an account, use /auth/login")
+     if session.exec(select(User).where(User.username == payload.username)).first():
+@@ -177,7 +181,7 @@ def create_user(payload: CreateUser, session: SessionDep):
+ 
+ @router.post("/login", response_model=AuthOut)
+ def login(payload: Login, session: SessionDep):
+-    addr = _norm(payload.addrs)
++    addr = _norm(payload.address)
+     user = session.exec(select(User).where(User.address == addr)).first()
+     if not user:
+         raise HTTPException(404, "no account for this wallet, use /auth/create_user")
+diff --git a/backend/app/routers/data.py b/backend/app/routers/data.py
+index 0e3db12..21ba3b1 100644
+--- a/backend/app/routers/data.py
++++ b/backend/app/routers/data.py
+@@ -5,9 +5,7 @@ from app.deps import CurrentUser
+ from app.database import SessionDep
+ from app.model import (
+     ActivityCreate, ActivityRead, ActivityUpdate,
+-    GoalCreate, GoalRead, GoalUpdate,
+     RuleCreate, RuleRead, RuleUpdate,
+-    TaskCreate, TaskRead, TaskUpdate,
+ )
+ 
+ 
+@@ -49,9 +47,9 @@ def make_router(obj_name: str, plural: str, Create, Update, Read) -> APIRouter:
+     return router
+ 
+ 
++# Goals and tasks are NOT generic CRUD: they mirror on-chain state and AI grading, so they have their own routers
++# (routers/goals.py, routers/tasks.py) where the server, not the client, decides status, amounts and results.
+ routers = [
+-    make_router("goal", "goals", GoalCreate, GoalUpdate, GoalRead),
+     make_router("rule", "rules", RuleCreate, RuleUpdate, RuleRead),
+     make_router("activity", "activities", ActivityCreate, ActivityUpdate, ActivityRead),
+-    make_router("task", "tasks", TaskCreate, TaskUpdate, TaskRead),
+ ]
+diff --git a/backend/app/routers/goals.py b/backend/app/routers/goals.py
+new file mode 100644
+index 0000000..d89b9cc
+--- /dev/null
++++ b/backend/app/routers/goals.py
+@@ -0,0 +1,148 @@
++"""
++Goals. The money lives in the lock contract under (owner address, goal id = this row's id), so the order matters:
++
++  1. POST /goals                  creates the row as `pending` and returns its id
++  2. wallet: lock(goalId, amount, unlockAt) on the contract   (user signs, user pays gas)
++  3. POST /goals/{id}/confirm     the BACKEND READS THE CONTRACT; if the lock is really there the goal becomes `active`
++                                  and amount / unlock time are copied from the chain, never trusted from the client
++  4a. lock period over: the user calls withdraw() on the contract, then POST /goals/{id}/sync marks it `liquidated`
++  4b. early: pass the task (routers/tasks.py), the backend relays the key to the contract and marks it `liquidated`.
++      POST /goals/{id}/release retries that relay if it failed.
++
++The client can never set status, amounts or tx hashes directly: the generic PATCH is gone.
++"""
++from datetime import datetime, timezone
++from typing import Annotated, Optional
++
++from fastapi import APIRouter, HTTPException, Query, Response
++from pydantic import BaseModel, StringConstraints
++from sqlmodel import func, select
++
++from app import chain, crud, task_ai
++from app.database import SessionDep
++from app.deps import CurrentUser
++from app.errors import ApiError
++from app.model import ActivityCreate, Goal, GoalCreate, GoalRead, utcnow
++
++router = APIRouter(prefix="/goals", tags=["goal"])
++
++TOKEN_DECIMALS = {"USDT": 6}
++MAX_PENDING = 10  # unconfirmed goals per user (a failed lock leaves one behind until it is deleted or confirmed)
++TxHash = Annotated[str, StringConstraints(pattern=r"^0x[0-9a-fA-F]{64}$")]
++
++
++class ConfirmBody(BaseModel):
++    tx_hash: Optional[TxHash] = None
++
++
++class ReleaseOut(BaseModel):
++    released: bool
++    tx_hash: Optional[str] = None
++    error: Optional[str] = None
++    goal: GoalRead
++
++
++def _own_goal(goal_id: int, session: SessionDep, user_id: int) -> Goal:
++    goal = crud.get_data("goal", goal_id, session, user_id)
++    if not goal:
++        raise HTTPException(404, "goal not found")
++    return goal
++
++
++def _log(session: SessionDep, user_id: int, kind: str, text: str, tx_hash: Optional[str] = None) -> None:
++    crud.create_data("activity", ActivityCreate(kind=kind, text=text, tx_hash=tx_hash), session, user_id)
++
++
++@router.get("", response_model=list[GoalRead])
++def list_goals(session: SessionDep, user: CurrentUser, limit: int = Query(100, ge=1, le=500), offset: int = Query(0, ge=0)):
++    return crud.read_data("goal", session, user.id, limit=limit, offset=offset)
++
++
++@router.get("/{goal_id}", response_model=GoalRead)
++def get_goal(goal_id: int, session: SessionDep, user: CurrentUser):
++    return _own_goal(goal_id, session, user.id)
++
++
++@router.post("", response_model=GoalRead, status_code=201)
++def create_goal(body: GoalCreate, session: SessionDep, user: CurrentUser):
++    if body.token not in TOKEN_DECIMALS:
++        raise HTTPException(422, "only USDT goals are supported")
++    if body.unlock_at <= utcnow():
++        raise HTTPException(422, "unlock_at must be in the future")
++    pending = session.exec(select(func.count()).select_from(Goal).where(Goal.user_id == user.id, Goal.status == "pending")).one()
++    if pending >= MAX_PENDING:
++        raise HTTPException(429, "too many unconfirmed goals, finish or delete them first")
++    ok, goal = crud.create_data("goal", body, session, user.id)  # status defaults to "pending"
++    if not ok:
++        raise HTTPException(400, "could not create goal")
++    return goal
++
++
++@router.delete("/{goal_id}", status_code=204)
++def delete_goal(goal_id: int, session: SessionDep, user: CurrentUser):
++    """Only an unconfirmed goal can be deleted (e.g. the user rejected the lock transaction). Locked goals are permanent records."""
++    goal = _own_goal(goal_id, session, user.id)
++    if goal.status != "pending":
++        raise HTTPException(409, "only unconfirmed goals can be deleted")
++    crud.delete_data("goal", goal_id, session, user.id)
++    return Response(status_code=204)
++
++
++@router.post("/{goal_id}/confirm", response_model=GoalRead)
++def confirm_goal(goal_id: int, session: SessionDep, user: CurrentUser, body: ConfirmBody = ConfirmBody()):
++    """Backend reads the contract. Idempotent: confirming an already confirmed goal just returns it."""
++    goal = _own_goal(goal_id, session, user.id)
++    if goal.status != "pending":
++        return goal
++    state = chain.get_goal(user.address, goal.id)
++    if state["amount"] == 0:
++        raise ApiError(409, "no lock found on-chain for this goal yet. If your transaction is still pending, try again in a moment.")
++
++    goal.amount_raw = str(state["amount"])
++    goal.amount = state["amount"] / 10 ** TOKEN_DECIMALS[goal.token]
++    goal.unlock_at = datetime.fromtimestamp(state["unlock_at"], tz=timezone.utc)
++    goal.status = "liquidated" if state["released"] else "active"
++    if body.tx_hash:
++        goal.tx_hash = body.tx_hash
++    session.add(goal)
++    session.commit()
++    session.refresh(goal)
++    _log(session, user.id, "lock", f"Locked ${goal.amount:,.2f} into {goal.name}", goal.tx_hash)
++    return goal
++
++
++@router.post("/{goal_id}/sync", response_model=GoalRead)
++def sync_goal(goal_id: int, session: SessionDep, user: CurrentUser):
++    """After the user's own withdraw(): read the contract and mark the goal liquidated if it was released."""
++    goal = _own_goal(goal_id, session, user.id)
++    if goal.status != "active":
++        return goal
++    state = chain.get_goal(user.address, goal.id)
++    if state["released"]:
++        goal.status = "liquidated"
++        goal.liquidated_at = utcnow()
++        session.add(goal)
++        session.commit()
++        session.refresh(goal)
++        _log(session, user.id, "unlock", f"Withdrew {goal.name} · ${goal.amount:,.2f} released")
++    return goal
++
++
++@router.post("/{goal_id}/release", response_model=ReleaseOut)
++def release_goal(goal_id: int, session: SessionDep, user: CurrentUser):
++    """Retry the backend -> contract release for a goal whose task was passed (e.g. the first relay failed). Idempotent."""
++    _own_goal(goal_id, session, user.id)
++    result = task_ai.release_goal(goal_id, session, user.id)
++    goal = _own_goal(goal_id, session, user.id)
++    return ReleaseOut(**result, goal=GoalRead.model_validate(goal, from_attributes=True))
++
++
++@router.get("/{goal_id}/unlock-key")
++def unlock_key(goal_id: int, session: SessionDep, user: CurrentUser):
++    """
++    The signed task key for a goal whose task was passed (403 otherwise). Normally the backend relays it itself; this is
++    the fallback so the user can submit it from their own wallet (unlockWithKey) if the relayer is down or out of gas.
++    The key only ever releases to the goal's owner, so exposing it to that owner is safe.
++    """
++    _own_goal(goal_id, session, user.id)
++    return task_ai.get_unlock_key(goal_id, session, user.id)
+diff --git a/backend/app/routers/tasks.py b/backend/app/routers/tasks.py
+new file mode 100644
+index 0000000..a84a748
+--- /dev/null
++++ b/backend/app/routers/tasks.py
+@@ -0,0 +1,64 @@
++"""
++AI unlock tasks.
++
++  POST /goals/{id}/task          generate (or return the pending) task for this goal. Category and difficulty are always the
++                                 ones committed when the goal was created: the client cannot pick an easier task later
++  GET  /goals/{id}/task          the latest task for this goal
++  POST /goals/{id}/task/verify   multipart: `text` and/or `file`. The AI judges the proof; on a pass the backend relays the
++                                 unlock key to the contract and the response says whether the funds were released
++  GET  /tasks                    passed tasks (drives "tasks done" and the streak)
++
++The client only ever sees title / description / what to submit. The answer key, rubric and unlock nonce never leave the server.
++"""
++from typing import Optional
++
++from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
++from sqlmodel import desc, select
++
++from app import crud, task_ai
++from app.database import SessionDep
++from app.deps import CurrentUser
++from app.errors import ApiError
++from app.model import Task, TaskRead
++
++router = APIRouter(tags=["task"])
++
++MAX_UPLOAD = max(task_ai.MAX_BYTES.values())
++
++
++@router.post("/goals/{goal_id}/task", response_model=TaskRead)
++def generate_task(goal_id: int, session: SessionDep, user: CurrentUser):
++    goal = crud.get_data("goal", goal_id, session, user.id)
++    if not goal:
++        raise HTTPException(404, "goal not found")
++    return task_ai.generate_goal_task(goal.task_category, goal.task_difficulty, session, user.id, goal_id)
++
++
++@router.get("/goals/{goal_id}/task", response_model=TaskRead)
++def current_task(goal_id: int, session: SessionDep, user: CurrentUser):
++    task = session.exec(select(Task).where(Task.user_id == user.id, Task.goal_id == goal_id).order_by(desc(Task.id))).first()
++    if not task:
++        raise HTTPException(404, "no task for this goal yet")
++    return task
++
++
++@router.post("/goals/{goal_id}/task/verify")
++def verify_task(
++    goal_id: int,
++    session: SessionDep,
++    user: CurrentUser,
++    text: Optional[str] = Form(None),
++    file: Optional[UploadFile] = File(None),
++):
++    media = None
++    if file is not None and file.filename:
++        data = file.file.read(MAX_UPLOAD + 1)  # never buffer more than the biggest allowed upload
++        if len(data) > MAX_UPLOAD:
++            raise ApiError(413, "file is too large")
++        media = (data, file.content_type or "")
++    return task_ai.verify_goal_task(goal_id, session, user.id, text=text, media=media)
++
++
++@router.get("/tasks", response_model=list[TaskRead])
++def completed_tasks(session: SessionDep, user: CurrentUser, limit: int = Query(500, ge=1, le=500)):
++    return session.exec(select(Task).where(Task.user_id == user.id, Task.status == "passed").order_by(desc(Task.id)).limit(limit)).all()
+diff --git a/backend/app/task_ai.py b/backend/app/task_ai.py
+index 5296650..d3b17cb 100644
+--- a/backend/app/task_ai.py
++++ b/backend/app/task_ai.py
+@@ -5,14 +5,14 @@ AI-generated unlock tasks.
+   verify_goal_task    -> takes the user's proof (text / image / audio / video), has the LLM judge it against the
+                          stored task, and when it passes returns a signed unlock key
+   get_unlock_key      -> re-issues the key for a task that already passed
++  release_goal        -> backend -> contract: relays the key (unlockWithKey) so the funds go back to the user's wallet
+ 
+ Env:
+   OPENAI_API_KEY            required
+   OPENAI_MODEL              chat model for generation + judging (default gpt-4o; must accept images for photo/video proof)
+   OPENAI_TRANSCRIBE_MODEL   audio -> text (default whisper-1)
+-  UNLOCK_SIGNER_KEY         private key of the backend signer the lock contract trusts (0x…)
++  UNLOCK_SIGNER_KEY         private key of the backend signer the lock contract trusts (0x…). See also app/chain.py env.
+   LOCK_CONTRACT_ADDRESS     USDTlock address (part of what is signed)
+-  CHAIN_ID                  default 11155111 (Sepolia)
+   PASS_SCORE                default 0.7
+ """
+ import base64
+@@ -23,14 +23,16 @@ import shutil
+ import subprocess
+ import tempfile
+ from datetime import timedelta
+-from decimal import Decimal
+ from typing import Optional
+ 
++from sqlalchemy import update
+ from sqlmodel import desc, select
+ 
++from app import chain
+ from app.crud import create_data, get_data, read_data, update_data
+ from app.database import SessionDep
+-from app.model import Task, TaskCreate, TaskUpdate, User, utcnow
++from app.errors import ApiError
++from app.model import ActivityCreate, Task, TaskCreate, TaskUpdate, User, as_utc, utcnow
+ from app.wallet import sign_digest, signer_address, unlock_digest
+ 
+ TASK_CATEGORIES = [
+@@ -62,15 +64,9 @@ MAX_BYTES = {"image": 8 * 1024 * 1024, "audio": 24 * 1024 * 1024, "video": 50 *
+ MIME_PREFIX = {"image": "image/", "audio": "audio/", "video": "video/"}
+ MAX_TASKS_PER_GOAL = 5  # stops "fail, regenerate an easier one, repeat" farming
+ KEY_TTL = timedelta(hours=24)
+-TOKEN_DECIMALS = {"USDT": 6, "NIM": 5}
+ 
+ 
+-class TaskError(Exception):
+-    """Expected failure with an HTTP status; main.py turns it into a JSON error response."""
+-    def __init__(self, status_code: int, message: str):
+-        super().__init__(message)
+-        self.status_code = status_code
+-        self.message = message
++TaskError = ApiError  # expected failures carry an HTTP status; main.py turns them into a JSON error
+ 
+ 
+ # ───────────────────────────── LLM helpers ─────────────────────────────
+@@ -141,6 +137,8 @@ def generate_goal_task(task_category: str, difficulty: str, session: SessionDep,
+     goal = get_data("goal", goal_id, session, user_id)
+     if not goal:
+         raise TaskError(404, "goal not found")
++    if goal.status == "pending":
++        raise TaskError(409, "this goal's lock is not confirmed on-chain yet")
+     if goal.status != "active":
+         raise TaskError(409, "goal is already released")
+ 
+@@ -262,11 +260,15 @@ JUDGE_SYSTEM = (
+ def verify_goal_task(goal_id: int, session: SessionDep, user_id: int, text: Optional[str] = None, media: Optional[tuple[bytes, str]] = None) -> dict:
+     """
+     Judge the user's proof for the goal's pending task. media is (raw bytes, content_type) for image / audio / video.
+-    Returns {passed, score, feedback, attempts_left, status, unlock}. `unlock` is the signed key only when passed.
++    Returns {passed, score, feedback, attempts_left, status, unlock, release}.
++    On a pass the backend immediately relays the signed key to the contract (`release`); `unlock` is also returned so the
++    client can submit it itself if the relay fails.
+     """
+     goal = get_data("goal", goal_id, session, user_id)
+     if not goal:
+         raise TaskError(404, "goal not found")
++    if goal.status != "active":
++        raise TaskError(409, "this goal is not locked")
+     tasks = _tasks_for_goal(session, user_id, goal_id)
+     task = tasks[0] if tasks else None
+     if not task:
+@@ -278,9 +280,18 @@ def verify_goal_task(goal_id: int, session: SessionDep, user_id: int, text: Opti
+ 
+     evidence, images = _build_evidence(task, text, media)  # validates input BEFORE an attempt is spent
+ 
+-    # NB: the session returns the same Task object each time, so read the count into a plain int before changing it
+-    attempts_before = task.attempts
+-    update_data("task", task.id, TaskUpdate(attempts=attempts_before + 1), session, user_id)  # spend the attempt first
++    # Spend the attempt with ONE conditional UPDATE: if two submissions race, only one can take the last attempt.
++    # (Done in the database, not with a Python lock, so it also holds with several server workers.)
++    spent = session.execute(
++        update(Task)
++        .where(Task.id == task.id, Task.user_id == user_id, Task.status == "pending", Task.attempts < Task.max_attempts)
++        .values(attempts=Task.attempts + 1)
++    )
++    session.commit()
++    if spent.rowcount != 1:
++        raise TaskError(409, "no attempts left, generate a new task")
++    session.refresh(task)
++    attempts_before = task.attempts - 1  # plain int: the session hands back the same Task object, so don't read it later
+     prompt = f"""TASK
+ Title: {task.title}
+ Category: {task.category} ({task.difficulty})
+@@ -319,14 +330,22 @@ Return JSON: {{"passed": true|false, "score": number between 0 and 1, "feedback"
+         changes = TaskUpdate(status="failed", score=score, feedback=feedback)
+     ok, task = update_data("task", task.id, changes, session, user_id)
+ 
+-    return {
++    out = {
+         "passed": passed,
+         "score": score,
+         "feedback": feedback,
+         "status": task.status,
+         "attempts_left": max(0, task.max_attempts - task.attempts),
+-        "unlock": get_unlock_key(goal_id, session, user_id) if passed else None,
++        "unlock": None,
++        "release": None,
+     }
++    if passed:
++        try:
++            out["unlock"] = get_unlock_key(goal_id, session, user_id)
++            out["release"] = release_goal(goal_id, session, user_id)
++        except TaskError as e:  # the pass is already saved; report what went wrong with the key / relay instead of failing the request
++            out["release"] = {"released": False, "tx_hash": None, "error": e.message}
++    return out
+ 
+ 
+ # ───────────────────────────── unlock key ─────────────────────────────
+@@ -335,36 +354,65 @@ def get_unlock_key(goal_id: int, session: SessionDep, user_id: int) -> dict:
+     Signed permission to release this goal's funds. Only exists for a task that passed.
+     Signed message (keccak256 of the packed fields, then an Ethereum signed-message signature):
+         lockContract, chainId, userAddress, goalId, amountRaw, nonce, expiry
+-    The lock contract must verify it with ECDSA against the trusted signer and mark goalId/nonce as used.
++    The lock contract verifies it with ECDSA against its trustedSigner and marks the nonce used.
+     The nonce is fixed per task, so re-issuing (e.g. after expiry) can never allow a second release.
++    amountRaw is the amount the contract stored when the user locked (copied at confirm), never a client-supplied number.
+     """
+     signer_key = os.getenv("UNLOCK_SIGNER_KEY")
+     lock_addr = os.getenv("LOCK_CONTRACT_ADDRESS")
+     if not signer_key or not lock_addr:
+-        raise TaskError(500, "unlock signing is not configured on the server")
++        raise TaskError(503, "unlock signing is not configured on the server")
+ 
+     goal = get_data("goal", goal_id, session, user_id)
+     if not goal:
+         raise TaskError(404, "goal not found")
++    if goal.status != "active" or not goal.amount_raw:
++        raise TaskError(409, "this goal is not locked")
+     tasks = _tasks_for_goal(session, user_id, goal_id)
+     task = next((t for t in tasks if t.status == "passed"), None)
+     if not task or not task.unlock_nonce:
+         raise TaskError(403, "task has not been passed")
+ 
+-    if task.unlock_expires_at <= utcnow():  # refresh the expiry only, nonce stays the same
++    if as_utc(task.unlock_expires_at) <= utcnow():  # refresh the expiry only, nonce stays the same
+         _, task = update_data("task", task.id, TaskUpdate(unlock_expires_at=utcnow() + KEY_TTL), session, user_id)
+ 
+     user = session.get(User, user_id)
+-    amount_raw = int(Decimal(str(goal.amount)) * (10 ** TOKEN_DECIMALS[goal.token]))
+-    chain_id = int(os.getenv("CHAIN_ID", "11155111"))
+-    expiry = int(task.unlock_expires_at.timestamp())
++    expiry = int(as_utc(task.unlock_expires_at).timestamp())
+ 
+-    digest = unlock_digest(lock_addr, chain_id, user.address, goal.id, amount_raw, task.unlock_nonce, expiry)
++    digest = unlock_digest(lock_addr, chain.chain_id(), user.address, goal.id, int(goal.amount_raw), task.unlock_nonce, expiry)
+     return {
+         "goal_id": goal.id,
+-        "amount": str(amount_raw),
++        "amount": goal.amount_raw,
+         "nonce": task.unlock_nonce,
+         "expiry": expiry,
+         "signature": sign_digest(digest, signer_key),
+         "signer": signer_address(signer_key),
+     }
++
++
++# ───────────────────────────── release (backend -> contract) ─────────────────────────────
++def release_goal(goal_id: int, session: SessionDep, user_id: int) -> dict:
++    """
++    Relays the goal's task key to the lock contract (the backend wallet pays the gas; the funds go to the user's wallet).
++    Idempotent: safe to call again after a failure. Returns {released, tx_hash, error}; raises only for "not allowed".
++    """
++    goal = get_data("goal", goal_id, session, user_id)
++    if not goal:
++        raise TaskError(404, "goal not found")
++    if goal.status == "liquidated":
++        return {"released": True, "tx_hash": goal.release_tx_hash, "error": None}
++
++    key = get_unlock_key(goal_id, session, user_id)  # 403 unless the task was passed
++    user = session.get(User, user_id)
++    try:
++        tx_hash = chain.relay_unlock(user.address, goal.id, key["nonce"], key["expiry"], key["signature"])
++    except TaskError as e:
++        return {"released": False, "tx_hash": None, "error": e.message}
++
++    goal.status = "liquidated"
++    goal.release_tx_hash = tx_hash
++    goal.liquidated_at = utcnow()
++    session.add(goal)
++    session.commit()
++    create_data("activity", ActivityCreate(kind="unlock", text=f"Task passed: {goal.name} released early", tx_hash=tx_hash), session, user_id)
++    return {"released": True, "tx_hash": tx_hash, "error": None}
+diff --git a/backend/e2e/README.md b/backend/e2e/README.md
+new file mode 100644
+index 0000000..12113dc
+--- /dev/null
++++ b/backend/e2e/README.md
+@@ -0,0 +1,14 @@
++# End-to-end tests (no testnet needed)
++
++These deploy the real `USDTlock` contract on a local in-memory EVM and drive the real FastAPI app against it
++(AI calls are stubbed). They prove that the contract, the Python signing code and the API agree with each other.
++
++```bash
++cd backend/e2e
++npm install                 # solc + OpenZeppelin, only used to compile
++npm run compile             # writes compiled.json from ../../contracts
++pip install "web3[tester]"  # local EVM (on top of ../requirements.txt)
++python test_contract.py     # contract rules + the signature the backend produces
++python test_flow.py         # sign-in, goals, AI task, relayer release, retries, tenant isolation
++```
++Quick API-only check (no chain, no AI): `cd backend && python test_smoke.py`.
+diff --git a/backend/e2e/compile_contracts.js b/backend/e2e/compile_contracts.js
+new file mode 100644
+index 0000000..9bdcb69
+--- /dev/null
++++ b/backend/e2e/compile_contracts.js
+@@ -0,0 +1,22 @@
++// Compiles MockToken + USDTlock with solc-js (no network needed beyond `npm install`) into compiled.json.
++const solc = require('solc'); const fs = require('fs'); const path = require('path');
++const contracts = path.join(__dirname, '..', '..', 'contracts');
++const sources = {};
++for (const f of ['MockToken.sol', 'USDTlock.sol']) sources[f] = { content: fs.readFileSync(path.join(contracts, f), 'utf8') };
++function findImports(p) {
++  const full = path.join(__dirname, 'node_modules', p);
++  return fs.existsSync(full) ? { contents: fs.readFileSync(full, 'utf8') } : { error: 'not found ' + p };
++}
++const out = JSON.parse(solc.compile(JSON.stringify({
++  language: 'Solidity', sources,
++  settings: { optimizer: { enabled: true, runs: 200 }, outputSelection: { '*': { '*': ['abi', 'evm.bytecode.object'] } } },
++}), { import: findImports }));
++let bad = false;
++for (const e of out.errors || []) { console.log(e.severity + ': ' + e.formattedMessage.split('\n')[0]); if (e.severity === 'error') bad = true; }
++if (bad) process.exit(1);
++const res = {};
++for (const f of Object.keys(out.contracts)) for (const c of Object.keys(out.contracts[f])) {
++  if (['MockToken', 'USDTlock'].includes(c)) res[c] = { abi: out.contracts[f][c].abi, bytecode: '0x' + out.contracts[f][c].evm.bytecode.object };
++}
++fs.writeFileSync(path.join(__dirname, 'compiled.json'), JSON.stringify(res));
++console.log('compiled:', Object.keys(res).join(', '));
+diff --git a/backend/e2e/package-lock.json b/backend/e2e/package-lock.json
+new file mode 100644
+index 0000000..b201d7d
+--- /dev/null
++++ b/backend/e2e/package-lock.json
+@@ -0,0 +1,108 @@
++{
++  "name": "nimlock-e2e",
++  "lockfileVersion": 3,
++  "requires": true,
++  "packages": {
++    "": {
++      "name": "nimlock-e2e",
++      "dependencies": {
++        "@openzeppelin/contracts": "^5.0.2",
++        "solc": "^0.8.20"
++      }
++    },
++    "node_modules/@openzeppelin/contracts": {
++      "version": "5.6.1",
++      "resolved": "https://registry.npmjs.org/@openzeppelin/contracts/-/contracts-5.6.1.tgz",
++      "integrity": "sha512-Ly6SlsVJ3mj+b18W3R8gNufB7dTICT105fJhodGAGgyC2oqnBAhqSiNDJ8V8DLY05cCz81GLI0CU5vNYA1EC/w==",
++      "license": "MIT"
++    },
++    "node_modules/command-exists": {
++      "version": "1.2.9",
++      "resolved": "https://registry.npmjs.org/command-exists/-/command-exists-1.2.9.tgz",
++      "integrity": "sha512-LTQ/SGc+s0Xc0Fu5WaKnR0YiygZkm9eKFvyS+fRsU7/ZWFF8ykFM6Pc9aCVf1+xasOOZpO3BAVgVrKvsqKHV7w==",
++      "license": "MIT"
++    },
++    "node_modules/commander": {
++      "version": "8.3.0",
++      "resolved": "https://registry.npmjs.org/commander/-/commander-8.3.0.tgz",
++      "integrity": "sha512-OkTL9umf+He2DZkUq8f8J9of7yL6RJKI24dVITBmNfZBmri9zYZQrKkuXiKhyfPSu8tUhnVBB1iKXevvnlR4Ww==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 12"
++      }
++    },
++    "node_modules/follow-redirects": {
++      "version": "1.16.3",
++      "resolved": "https://registry.npmjs.org/follow-redirects/-/follow-redirects-1.16.3.tgz",
++      "integrity": "sha512-toOSoqN6d51Wjf1aOFJYcoVv1aND9rj/CwjLU0Vz40oDuSpWDayCeKe4JpL5NL0WdFvoOOCI3BRo69HahjbR1A==",
++      "funding": [
++        {
++          "type": "individual",
++          "url": "https://github.com/sponsors/RubenVerborgh"
++        }
++      ],
++      "license": "MIT",
++      "engines": {
++        "node": ">=4.0"
++      },
++      "peerDependenciesMeta": {
++        "debug": {
++          "optional": true
++        }
++      }
++    },
++    "node_modules/js-sha3": {
++      "version": "0.8.0",
++      "resolved": "https://registry.npmjs.org/js-sha3/-/js-sha3-0.8.0.tgz",
++      "integrity": "sha512-gF1cRrHhIzNfToc802P800N8PpXS+evLLXfsVpowqmAFR9uwbi89WvXg2QspOmXL8QL86J4T1EpFu+yUkwJY3Q==",
++      "license": "MIT"
++    },
++    "node_modules/memorystream": {
++      "version": "0.3.1",
++      "resolved": "https://registry.npmjs.org/memorystream/-/memorystream-0.3.1.tgz",
++      "integrity": "sha512-S3UwM3yj5mtUSEfP41UZmt/0SCoVYUcU1rkXv+BQ5Ig8ndL4sPoJNBUJERafdPb5jjHJGuMgytgKvKIf58XNBw==",
++      "engines": {
++        "node": ">= 0.10.0"
++      }
++    },
++    "node_modules/semver": {
++      "version": "5.7.3",
++      "resolved": "https://registry.npmjs.org/semver/-/semver-5.7.3.tgz",
++      "integrity": "sha512-kM18BPOqTi0+TB68703/GJRpAML5Me+IDQsR1J26YB3EFKKNEyHIVZuWDX7+WKQB3tHwDwgk24BfhdpWUbytvQ==",
++      "license": "ISC",
++      "bin": {
++        "semver": "bin/semver"
++      }
++    },
++    "node_modules/solc": {
++      "version": "0.8.38",
++      "resolved": "https://registry.npmjs.org/solc/-/solc-0.8.38.tgz",
++      "integrity": "sha512-DsDLa7uACQVVkE0DYNnUGC49b/yuCJ9ymWlcCEwmaJGcETPC6pTC+BXaRK9ADW8YVeMyxEKUtJsUwRAIG28jtQ==",
++      "license": "MIT",
++      "dependencies": {
++        "command-exists": "^1.2.8",
++        "commander": "^8.1.0",
++        "follow-redirects": "^1.12.1",
++        "js-sha3": "0.8.0",
++        "memorystream": "^0.3.1",
++        "semver": "^5.5.0",
++        "tmp": "0.2.6"
++      },
++      "bin": {
++        "solcjs": "solc.js"
++      },
++      "engines": {
++        "node": ">=16.0.0"
++      }
++    },
++    "node_modules/tmp": {
++      "version": "0.2.6",
++      "resolved": "https://registry.npmjs.org/tmp/-/tmp-0.2.6.tgz",
++      "integrity": "sha512-5sJPdPjfI5Kx+qbrDesxkglRBxW//g7hCsqspEjwkewGvBMGIKMOTKzLt1hFVJzyadba3lDUN20O9qhvbQUSTA==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=14.14"
++      }
++    }
++  }
++}
+diff --git a/backend/e2e/package.json b/backend/e2e/package.json
+new file mode 100644
+index 0000000..369b3bc
+--- /dev/null
++++ b/backend/e2e/package.json
+@@ -0,0 +1,10 @@
++{
++  "name": "nimlock-e2e",
++  "private": true,
++  "description": "Compiles the Solidity contracts so the Python end-to-end tests can deploy them on a local in-memory EVM.",
++  "scripts": { "compile": "node compile_contracts.js" },
++  "dependencies": {
++    "@openzeppelin/contracts": "^5.0.2",
++    "solc": "^0.8.20"
++  }
++}
+diff --git a/backend/e2e/test_contract.py b/backend/e2e/test_contract.py
+new file mode 100644
+index 0000000..dc2df7b
+--- /dev/null
++++ b/backend/e2e/test_contract.py
+@@ -0,0 +1,84 @@
++import json, os, sys, secrets
++HERE = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, os.path.join(HERE, '..'))
++from web3 import Web3, EthereumTesterProvider
++from eth_account import Account
++from app.wallet import unlock_digest, sign_digest, signer_address
++
++C = json.load(open(os.path.join(HERE, 'compiled.json')))
++w3 = Web3(EthereumTesterProvider())
++owner, user, relayer, attacker, other = w3.eth.accounts[:5]
++signer_key = Account.create().key.hex()
++SIGNER = signer_address(signer_key)
++
++def deploy(name, *args):
++    c = w3.eth.contract(abi=C[name]['abi'], bytecode=C[name]['bytecode'])
++    h = c.constructor(*args).transact({'from': owner})
++    return w3.eth.contract(address=w3.eth.wait_for_transaction_receipt(h).contractAddress, abi=C[name]['abi'])
++
++usdt = deploy('MockToken', 'Test USDT', 'USDT', 6)
++lock = deploy('USDTlock', usdt.address, SIGNER)
++chain_id = w3.eth.chain_id
++now = lambda: w3.eth.get_block('latest').timestamp
++def raises(fn, label):
++    try: fn(); print('FAIL (no revert):', label); sys.exit(1)
++    except SystemExit: raise
++    except Exception as e: print('ok  reverts:', label, '->', str(e)[:70].replace('\n',' '))
++
++def key_for(user_addr, goal_id, amount, expiry, nonce=None, key=signer_key):
++    nonce = nonce or '0x' + secrets.token_hex(32)
++    d = unlock_digest(lock.address, chain_id, user_addr, goal_id, amount, nonce, expiry)
++    return nonce, sign_digest(d, key)
++
++AMT = 25 * 10**6
++for a in (user, other, attacker):
++    usdt.functions.faucet(100 * 10**6).transact({'from': a}); usdt.functions.approve(lock.address, 10**12).transact({'from': a})
++bal = lambda a: usdt.functions.balanceOf(a).call()
++
++# lock
++lock.functions.lock(1, AMT, now() + 1000).transact({'from': user})
++lock.functions.lock(2, AMT, now() + 1000).transact({'from': user})
++assert lock.functions.viewLockedUSDT(user).call() == 2 * AMT
++assert lock.functions.getGoal(user, 1).call()[0] == AMT
++print('ok  lock x2, viewLockedUSDT =', 2 * AMT)
++raises(lambda: lock.functions.lock(1, AMT, now() + 1000).transact({'from': user}), 'goalId reuse')
++raises(lambda: lock.functions.lock(3, AMT, now() - 5).transact({'from': user}), 'unlockAt in the past')
++raises(lambda: lock.functions.lock(3, 0, now() + 100).transact({'from': user}), 'amount 0')
++lock.functions.lock(1, 5 * 10**6, now() + 1000).transact({'from': attacker})  # same goalId for another user: allowed, no squatting
++print('ok  same goalId from another address is independent (no squatting)')
++
++# no key / early withdraw
++raises(lambda: lock.functions.withdraw(user, 1).transact({'from': user}), 'withdraw before unlockAt')
++
++# task key paths
++exp = now() + 600
++n, sig = key_for(user, 1, AMT, exp)
++before = bal(user)
++lock.functions.unlockWithKey(user, 1, n, exp, sig).transact({'from': relayer})   # relayer pays gas
++assert bal(user) == before + AMT and bal(relayer) == 0
++assert lock.functions.viewLockedUSDT(user).call() == AMT
++print('ok  relayer-submitted key released', AMT, 'to the OWNER (relayer got 0)')
++raises(lambda: lock.functions.unlockWithKey(user, 1, n, exp, sig).transact({'from': relayer}), 'replay same key / already released')
++n2, sig2 = key_for(user, 2, AMT, exp, key=Account.create().key.hex())
++raises(lambda: lock.functions.unlockWithKey(user, 2, n2, exp, sig2).transact({'from': relayer}), 'key signed by the wrong signer')
++n3, sig3 = key_for(user, 2, AMT, now() - 1)
++raises(lambda: lock.functions.unlockWithKey(user, 2, n3, now() - 1, sig3).transact({'from': relayer}), 'expired key')
++n4, sig4 = key_for(user, 2, AMT + 1, exp)  # amount in key differs from on-chain amount
++raises(lambda: lock.functions.unlockWithKey(user, 2, n4, exp, sig4).transact({'from': relayer}), 'key for a different amount')
++n5, sig5 = key_for(user, 2, AMT, exp)
++raises(lambda: lock.functions.unlockWithKey(attacker, 1, n5, exp, sig5).transact({'from': relayer}), "user's key replayed on attacker's goal")
++raises(lambda: lock.functions.unlockWithKey(user, 2, n5, exp, sig5[:-2] + '00').transact({'from': relayer}), 'tampered signature')
++
++# time-based withdraw: anyone can trigger, owner is paid
++w3.provider.ethereum_tester.time_travel(now() + 2000)
++w3.provider.ethereum_tester.mine_blocks(1)
++before = bal(user)
++lock.functions.withdraw(user, 2).transact({'from': relayer})
++assert bal(user) == before + AMT
++assert lock.functions.viewLockedUSDT(user).call() == 0
++print('ok  withdraw after unlockAt paid the owner (triggered by a third party)')
++raises(lambda: lock.functions.withdraw(user, 2).transact({'from': user}), 'double withdraw')
++# old API is gone
++assert not any(f.get('name') == 'unlockUSDT' for f in C['USDTlock']['abi'])
++print('ok  old unrestricted unlockUSDT() no longer exists')
++print('CONTRACT TESTS PASSED; digest in wallet.py matches the contract')
+diff --git a/backend/e2e/test_flow.py b/backend/e2e/test_flow.py
+new file mode 100644
+index 0000000..c17cdee
+--- /dev/null
++++ b/backend/e2e/test_flow.py
+@@ -0,0 +1,202 @@
++import json, os, sys, tempfile
++from datetime import datetime, timezone, timedelta
++HERE = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, os.path.join(HERE, '..'))
++from web3 import Web3, EthereumTesterProvider
++from eth_account import Account
++from eth_account.messages import encode_defunct
++
++db = os.path.join(tempfile.mkdtemp(), 'flow.db')
++signer_acct, relayer_acct = Account.create(), Account.create()
++os.environ.update(JWT_SECRET='x' * 40, DATABASE_URL=f'sqlite:///{db}', UNLOCK_SIGNER_KEY=signer_acct.key.hex(),
++                  RELAYER_PRIVATE_KEY=relayer_acct.key.hex(), TX_TIMEOUT='10')
++os.environ.pop('AUTH_DEV_MODE', None)
++
++C = json.load(open(os.path.join(HERE, 'compiled.json')))
++w3 = Web3(EthereumTesterProvider())
++deployer = w3.eth.accounts[0]
++def deploy(name, *args):
++    h = w3.eth.contract(abi=C[name]['abi'], bytecode=C[name]['bytecode']).constructor(*args).transact({'from': deployer})
++    return w3.eth.contract(address=w3.eth.wait_for_transaction_receipt(h).contractAddress, abi=C[name]['abi'])
++usdt = deploy('MockToken', 'Test USDT', 'USDT', 6)
++lock = deploy('USDTlock', usdt.address, signer_acct.address)
++os.environ['LOCK_CONTRACT_ADDRESS'] = lock.address
++w3.eth.send_transaction({'from': deployer, 'to': relayer_acct.address, 'value': 10**18})
++
++from app import chain, task_ai
++chain.set_web3(w3)
++from fastapi.testclient import TestClient
++from app.main import app
++
++# ---- stub the LLM: generation returns a quiz, the judge passes only the answer "42" ----
++calls = {'gen': 0, 'judge': 0}
++def fake_llm(prompt, *, system=None, images=None):
++    if 'Create ONE task' in prompt:
++        calls['gen'] += 1
++        return {'title': 'Answer to everything', 'description': 'Type the answer to life, the universe and everything.',
++                'submission_type': 'text', 'answer_key': '42', 'rubric': 'Pass only if the answer is 42.'}
++    calls['judge'] += 1
++    sub = prompt.split('<submission>')[1].split('</submission>')[0]
++    ok = '42' in sub
++    return {'passed': ok, 'score': 0.95 if ok else 0.1, 'feedback': 'Correct!' if ok else 'Not quite.'}
++task_ai.use_llm = fake_llm
++
++def send(fn, acct):
++    tx = fn.build_transaction({'from': acct.address, 'nonce': w3.eth.get_transaction_count(acct.address), 'chainId': w3.eth.chain_id, 'gasPrice': w3.eth.gas_price})
++    h = w3.eth.send_raw_transaction(acct.sign_transaction(tx).raw_transaction)
++    r = w3.eth.wait_for_transaction_receipt(h); assert r['status'] == 1, 'tx failed'; return h.hex()
++def fund(acct, usd=100):
++    w3.eth.send_transaction({'from': deployer, 'to': acct.address, 'value': 10**18})
++    send(usdt.functions.faucet(usd * 10**6), acct); send(usdt.functions.approve(lock.address, 10**12), acct)
++bal = lambda a: usdt.functions.balanceOf(a).call()
++chain_now = lambda: w3.eth.get_block('latest').timestamp
++def sign_text(acct, text): return '0x' + acct.sign_message(encode_defunct(text=text)).signature.hex().removeprefix('0x')
++def iso(dt): return dt.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z')
++def check(cond, label):
++    if not cond: print('FAIL:', label); sys.exit(1)
++    print('ok ', label)
++
++alice, bob = Account.create(), Account.create()
++fund(alice); fund(bob)
++
++with TestClient(app) as c:
++    def login(acct, username=None):
++        n = c.get('/auth/nonce', params={'address': acct.address}).json()
++        sig = sign_text(acct, n['message'])
++        r = c.post('/auth/login', json={'address': acct.address, 'signature': sig})
++        if r.status_code == 404 and username:
++            r = c.post('/auth/create_user', json={'address': acct.address, 'username': username, 'signature': sig})
++        return r
++    H = lambda t: {'Authorization': f'Bearer {t}'}
++
++    # ───── auth ─────
++    check(c.get('/goals').status_code == 401, 'no token -> 401')
++    n1 = c.get('/auth/nonce', params={'address': alice.address}).json(); n2 = c.get('/auth/nonce', params={'address': alice.address}).json()
++    check(n1['message'] == n2['message'], 'a valid nonce is reused (a stranger cannot clobber it)')
++    r = c.post('/auth/login', json={'address': alice.address, 'signature': sign_text(alice, n1['message'])})
++    check(r.status_code == 404, 'login for an unknown wallet -> 404 (nonce NOT burned)')
++    r = c.post('/auth/create_user', json={'address': alice.address, 'username': 'alice_01', 'signature': sign_text(bob, n1['message'])})
++    check(r.status_code == 401, "someone else's signature is rejected")
++    r = c.post('/auth/create_user', json={'address': alice.address, 'username': 'alice_01', 'signature': sign_text(alice, n1['message'])})
++    check(r.status_code == 201 and r.json()['user']['username'] == 'alice_01', 'create_user with the SAME signature after the 404 -> 201 + JWT')
++    ta = r.json()['token']
++    r = c.post('/auth/create_user', json={'address': alice.address, 'username': 'alice_01', 'signature': sign_text(alice, n1['message'])})
++    check(r.status_code == 409, 'cannot create the same wallet twice')
++    check(login(alice).status_code == 200, 'returning login with a fresh nonce -> 200')
++    r = c.post('/auth/login', json={'address': alice.address, 'signature': sign_text(alice, n1['message'])})
++    check(r.status_code == 401, 'a used nonce cannot be replayed')
++    tb = login(bob, 'bob_02').json()['token']
++    check(c.get('/me', headers=H(ta)).json()['address'] == alice.address.lower(), '/me returns the authenticated wallet')
++    check(c.get('/goals', headers={'Authorization': 'Bearer garbage'}).status_code == 401, 'garbage token -> 401')
++
++    # ───── goal lifecycle: pending -> lock on-chain -> confirm ─────
++    unlock_at = datetime.now(timezone.utc) + timedelta(days=30)
++    body = {'name': 'Tesla fund', 'amount': 25, 'token': 'USDT', 'unlock_at': iso(unlock_at), 'task_category': 'brain_teaser', 'task_difficulty': 'easy'}
++    check(c.post('/goals', json={**body, 'status': 'active', 'amount_raw': '1'}, headers=H(ta)).json()['status'] == 'pending', 'client cannot choose the goal status (extra fields ignored)')
++    c.delete('/goals/1', headers=H(ta))
++    g = c.post('/goals', json=body, headers=H(ta)).json(); gid = g['id']
++    check(g['status'] == 'pending', 'new goal is pending')
++    check(c.post('/goals', json={**body, 'unlock_at': iso(datetime.now(timezone.utc) - timedelta(days=1))}, headers=H(ta)).status_code == 422, 'unlock_at in the past -> 422')
++    check(c.post('/goals', json={**body, 'token': 'NIM'}, headers=H(ta)).status_code == 422, 'only USDT goals')
++    r = c.post(f'/goals/{gid}/confirm', json={}, headers=H(ta))
++    check(r.status_code == 409, 'confirm before the lock exists on-chain -> 409')
++    check(c.post(f'/goals/{gid}/task', headers=H(ta)).status_code == 409, 'no task for an unconfirmed goal')
++
++    lock_tx = send(lock.functions.lock(gid, 25 * 10**6, chain_now() + 86400 * 30), alice)
++    check(c.post(f'/goals/{gid}/confirm', json={}, headers=H(tb)).status_code == 404, "bob cannot confirm alice's goal")
++    r = c.post(f'/goals/{gid}/confirm', json={'tx_hash': lock_tx if lock_tx.startswith('0x') else '0x' + lock_tx}, headers=H(ta)).json()
++    check(r['status'] == 'active' and abs(r['amount'] - 25) < 1e-9, 'confirm reads the contract -> active, amount copied from chain')
++    check(c.post(f'/goals/{gid}/confirm', json={}, headers=H(ta)).json()['status'] == 'active', 'confirm is idempotent')
++    check(c.delete(f'/goals/{gid}', headers=H(ta)).status_code == 409, 'a locked goal cannot be deleted')
++    check(c.get(f'/goals/{gid}', headers=H(tb)).status_code == 404, "bob cannot read alice's goal")
++    check(c.patch(f'/goals/{gid}', json={'status': 'liquidated'}, headers=H(ta)).status_code in (404, 405), 'no generic PATCH to fake a release')
++    check(bal(alice.address) == 75 * 10**6, 'alice USDT is in the contract (75 left in wallet)')
++
++    # ───── AI task ─────
++    check(c.post(f'/goals/{gid}/release', headers=H(ta)).status_code == 403, 'release before passing a task -> 403')
++    t = c.post(f'/goals/{gid}/task', json={}, headers=H(ta)).json()
++    check(t['status'] == 'pending' and 'answer_key' not in t and 'rubric' not in t and 'unlock_nonce' not in t, 'task response hides answer_key / rubric / nonce')
++    check(c.post(f'/goals/{gid}/task', json={}, headers=H(ta)).json()['id'] == t['id'] and calls['gen'] == 1, 'generate is idempotent (one live task, one LLM call)')
++    check(c.post(f'/goals/{gid}/task', headers=H(tb)).status_code == 404, "bob cannot generate a task for alice's goal")
++    check(c.post(f'/goals/{gid}/task/verify', data={'text': '42'}, headers=H(tb)).status_code == 404, "bob cannot submit proof for alice's goal")
++    r = c.post(f'/goals/{gid}/task/verify', data={'text': 'seven'}, headers=H(ta)).json()
++    check(r['passed'] is False and r['attempts_left'] == 2 and r['release'] is None and r['unlock'] is None, 'wrong answer: no key, no release, attempt spent')
++    check(c.post(f'/goals/{gid}/task/verify', data={}, headers=H(ta)).status_code == 422, 'empty submission rejected without spending an attempt')
++    r = c.post(f'/goals/{gid}/task/verify', data={'text': 'It is 42'}, headers=H(ta)).json()
++    check(r['passed'] is True and r['release']['released'] is True and r['release']['tx_hash'], 'right answer: backend relayed the key to the contract')
++    check(bal(alice.address) == 100 * 10**6, "funds are back in ALICE's wallet (relayer paid the gas)")
++    check(lock.functions.getGoal(alice.address, gid).call()[2] is True, 'contract says released')
++    gg = c.get(f'/goals/{gid}', headers=H(ta)).json()
++    check(gg['status'] == 'liquidated' and gg['release_tx_hash'] == r['release']['tx_hash'], 'DB goal liquidated with the release tx hash')
++    check(len(c.get('/tasks', headers=H(ta)).json()) == 1 and c.get('/tasks', headers=H(tb)).json() == [], '/tasks lists alice\'s completion only')
++    acts = [a['kind'] for a in c.get('/activities', headers=H(ta)).json()]
++    check('lock' in acts and 'unlock' in acts, 'server wrote lock + unlock activity rows')
++    check(c.post(f'/goals/{gid}/release', headers=H(ta)).json()['released'] is True, 'release retry after success is a no-op')
++
++    # ───── timed withdraw: user's own tx, then sync ─────
++    g2 = c.post('/goals', json={**body, 'name': 'Holiday'}, headers=H(ta)).json()
++    send(lock.functions.lock(g2['id'], 10 * 10**6, chain_now() + 1000), alice)
++    c.post(f"/goals/{g2['id']}/confirm", json={}, headers=H(ta))
++    check(c.post(f"/goals/{g2['id']}/sync", headers=H(ta)).json()['status'] == 'active', 'sync does nothing while still locked')
++    w3.provider.ethereum_tester.time_travel(chain_now() + 2000); w3.provider.ethereum_tester.mine_blocks(1)
++    send(lock.functions.withdraw(alice.address, g2['id']), alice)
++    r = c.post(f"/goals/{g2['id']}/sync", headers=H(ta)).json()
++    check(r['status'] == 'liquidated', 'after the user withdraws, sync marks the goal liquidated (read from chain)')
++
++    # ───── relay failure then retry ─────
++    g3 = c.post('/goals', json={**body, 'name': 'Rainy day'}, headers=H(ta)).json()
++    send(lock.functions.lock(g3['id'], 5 * 10**6, chain_now() + 86400 * 30), alice)
++    c.post(f"/goals/{g3['id']}/confirm", json={}, headers=H(ta)); c.post(f"/goals/{g3['id']}/task", json={}, headers=H(ta))
++    os.environ['RELAYER_PRIVATE_KEY'] = Account.create().key.hex()  # an unfunded relayer
++    r = c.post(f"/goals/{g3['id']}/task/verify", data={'text': '42'}, headers=H(ta)).json()
++    check(r['passed'] is True and r['release']['released'] is False and r['release']['error'] and r['unlock'], 'relay failed: pass is kept, key is returned, error explained -> "%s"' % r['release']['error'][:60])
++    check(c.get(f"/goals/{g3['id']}", headers=H(ta)).json()['status'] == 'active', 'goal stays active until the chain confirms')
++    os.environ['RELAYER_PRIVATE_KEY'] = relayer_acct.key.hex()
++    r = c.post(f"/goals/{g3['id']}/release", headers=H(ta)).json()
++    check(r['released'] is True and r['goal']['status'] == 'liquidated', 'retry via /release succeeds')
++
++    # ───── wallet fallback: relayer is down, the user submits the key from their own wallet ─────
++    g5 = c.post('/goals', json={**body, 'name': 'Fallback'}, headers=H(ta)).json()
++    send(lock.functions.lock(g5['id'], 5 * 10**6, chain_now() + 86400 * 30), alice)
++    c.post(f"/goals/{g5['id']}/confirm", json={}, headers=H(ta)); c.post(f"/goals/{g5['id']}/task", headers=H(ta))
++    check(c.get(f"/goals/{g5['id']}/unlock-key", headers=H(ta)).status_code == 403, 'unlock-key is refused until the task is passed')
++    os.environ['RELAYER_PRIVATE_KEY'] = Account.create().key.hex()  # relayer unfunded again
++    check(c.post(f"/goals/{g5['id']}/task/verify", data={'text': '42'}, headers=H(ta)).json()['release']['released'] is False, 'relayer down: task passed, funds not moved yet')
++    check(c.get(f"/goals/{g5['id']}/unlock-key", headers=H(tb)).status_code == 404, "bob cannot fetch alice's unlock key")
++    key = c.get(f"/goals/{g5['id']}/unlock-key", headers=H(ta)).json()   # still available after a reload, not only in the verify response
++    before = bal(alice.address)
++    send(lock.functions.unlockWithKey(alice.address, g5['id'], key['nonce'], key['expiry'], key['signature']), alice)
++    check(bal(alice.address) == before + 5 * 10**6, 'alice submitted the key herself (she paid the gas) and got her USDT back')
++    check(c.post(f"/goals/{g5['id']}/sync", headers=H(ta)).json()['status'] == 'liquidated', 'sync then marks the goal liquidated')
++    os.environ['RELAYER_PRIVATE_KEY'] = relayer_acct.key.hex()
++
++    # ───── the task a user must do is fixed when the goal is created ─────
++    g6 = c.post('/goals', json={**body, 'name': 'Commitment', 'task_category': 'finance_iq', 'task_difficulty': 'hard'}, headers=H(ta)).json()
++    send(lock.functions.lock(g6['id'], 5 * 10**6, chain_now() + 86400 * 30), alice)
++    c.post(f"/goals/{g6['id']}/confirm", json={}, headers=H(ta))
++    t6 = c.post(f"/goals/{g6['id']}/task", json={'category': 'brain_teaser', 'difficulty': 'easy'}, headers=H(ta)).json()
++    check(t6['category'] == 'finance_iq' and t6['difficulty'] == 'hard', 'a client-supplied category/difficulty is ignored: the goal\'s committed task type is used')
++
++    # ───── parallel submissions cannot win extra attempts ─────
++    from concurrent.futures import ThreadPoolExecutor
++    judged_before = calls['judge']
++    with ThreadPoolExecutor(8) as pool:
++        codes = list(pool.map(lambda _: c.post(f"/goals/{g6['id']}/task/verify", data={'text': 'wrong'}, headers=H(ta)).status_code, range(8)))
++    check(calls['judge'] - judged_before == t6['max_attempts'] and codes.count(200) == t6['max_attempts'], '8 parallel wrong answers -> exactly %d attempts judged, the rest refused (%s)' % (t6['max_attempts'], sorted(set(codes))))
++    check(c.get(f"/goals/{g6['id']}/task", headers=H(ta)).json()['status'] == 'failed', 'task is failed once the attempts are used')
++    check(c.post(f"/goals/{g6['id']}/task/verify", data={'text': '42'}, headers=H(ta)).status_code == 409, 'a failed task cannot be answered any more')
++    t6b = c.post(f"/goals/{g6['id']}/task", headers=H(ta)).json()
++    check(t6b['id'] != t6['id'] and t6b['status'] == 'pending', 'after failing, the user can get a new task (capped per goal)')
++
++    # ───── the saved key cannot be replayed / used on another goal ─────
++    g4 = c.post('/goals', json={**body, 'name': 'Another'}, headers=H(ta)).json()
++    send(lock.functions.lock(g4['id'], 5 * 10**6, chain_now() + 86400 * 30), alice)
++    c.post(f"/goals/{g4['id']}/confirm", json={}, headers=H(ta))
++    check(c.post(f"/goals/{g4['id']}/release", headers=H(ta)).status_code == 403, "an earlier goal's pass does not unlock a different goal")
++
++    # ───── tz-aware timestamps in responses ─────
++    import re
++    has_zone = lambda s: s is None or re.search(r'(Z|[+-]\d\d:?\d\d)$', s) is not None
++    gl = c.get('/goals', headers=H(ta)).json()
++    check(gl and all(has_zone(g[k]) for g in gl for k in ('created_at', 'unlock_at', 'liquidated_at')), 'every timestamp in a goal response carries a timezone (the UI never guesses local time)')
++print('BACKEND E2E PASSED  (LLM calls: %d generate, %d judge)' % (calls['gen'], calls['judge']))
+diff --git a/backend/nimlock.db b/backend/nimlock.db
+deleted file mode 100644
+index 0974ec04189684bd49c31fff89902f176c0339e9..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 53248
+zcmeI&-)`Gf0LO8A{gcK`wBA&?syJ6uA`t&3F1UiMbGJa^FgFDzgd#8YGOLcW#V62m
+zw~mds;SG2lo&z1nr-_40s|q1ueLs>_+vks+^Yd|HxyMhsp$x?H>1^Ujao^Z8Ow;&M
+z2*WUHhGEo=CAGb|+%(LU^{dp34}W>3I;mCuFz$YL*R03&_jZ5Z9a{bBpVi-Xe%Mh3
+z007|TdbRDw`}<}X#(r=Xo(-j!oDSznFdK%xTCX3vc6(rpj`Ps|UaVCReMhKDqM5a5
+z^>z!o8&AC`>#kPVT~=Y)UACij(XuLy{eAP-&!qP(3e>UGvYYiXXg}!M*%??>RWb~H
+z@on2ZeB5@0(;o=uq}%;KSXF(5jx(?y*{<4^jHa_d9CiEcf!YjxU6^Z_eXzo^(RA`M
+z3S{69Jt-cx2lk-TvvaM#aXY=X`&4{wKNZc;Z>a+v^<BI3$Wi+)Kc{f*Bipr|L;F~$
+zQ!T8l$9T1}+Lu<gT0d5|8}|>)bDg9&lHpIGJlARJZEHOOU7#zf81%knvg4gf<MRXa
+z_153|AI$=9F$lU<^~ysm>*kNL+~2yWS1OHz1M|%!&0P1X|L)|n*Ly|Ns-A{%ariPg
+zlZ97>JR837k{7z{wwJ->=fB-Wa80hg?fjIQ&7(j^rPeF!gS}cojk4Na=6DfrrBmwd
+z7wPb-LbYt?hIP@zs><`1fgYXQg)KuF6_@yd^unmHkqT=X7ZwGvn%};7(C>Hcwv#*7
+zt!8HYJRFO!j{A-Z^}2*2FOfqz3&-PNmY>b4^>vf@y8Jft`K7m_tc_aVTF-B_g351k
+zL(oTgv$v7v_iiK2PZg?VGne0@iB*lg$z@8-Pd@#)l^a-ZGM&eAaSO~9$mwZNoYOpx
+zrlZp<?|1)n3r?gb=SgAu|IIv%!dLUq&u&$hQ}tg+cyK38_-B1*Or!FAe-<Q(THnaB
+zIdM8qPFB83SL>;u)wXD64O_48nQ71$AEiO7Lbcq<1-)o;<+oSXSK*+?;Y6RLF2BiK
+zS)UD7D}BJ<yZKKJ000000Pz1~sZ-|p9{>OV0Dw~C{XYNz0002x$NPT(00000%8&Q|
+z000000F)o^{{a91001aI-v0vt0000`e!Tw&00000p!|6L2LJ#70HFN%|9=1g0002W
+XkN5uo00000lpoLk000000F>WfZ%~A-
+
+diff --git a/backend/requirements.txt b/backend/requirements.txt
+index cb0ff6a..12a014c 100644
+--- a/backend/requirements.txt
++++ b/backend/requirements.txt
+@@ -1,7 +1,11 @@
+-fastapi
++fastapi>=0.110
+ uvicorn[standard]
+-sqlmodel
+-httpx        # only for tests
++sqlmodel>=0.0.16
++python-multipart>=0.0.9   # file uploads for task proof (image / audio / video)
++PyJWT>=2.8                # login tokens
++openai>=1.40              # task generation + judging
++web3>=7                   # backend -> lock contract (reads goals, relays the unlock key)
+ eth-utils
+ eth-account
+-eth-abi  
+\ No newline at end of file
++eth-abi
++httpx                     # only for tests
+diff --git a/backend/test_smoke.py b/backend/test_smoke.py
+index 199d654..0096e27 100644
+--- a/backend/test_smoke.py
++++ b/backend/test_smoke.py
+@@ -1,35 +1,53 @@
++"""
++Quick API smoke test (no chain, no AI): run from the backend folder with `python test_smoke.py`.
++Uses the dev-header login (AUTH_DEV_MODE=1). Chain + AI + wallet-signature login are covered by the end-to-end flow
++described in the README.
++"""
+ import os
+ os.environ["AUTH_DEV_MODE"] = "1"
+ os.environ["DATABASE_URL"] = "sqlite:///./test.db"
++os.environ.setdefault("JWT_SECRET", "test-secret-test-secret-test-secret")
++if os.path.exists("test.db"):
++    os.remove("test.db")
++from datetime import datetime, timedelta, timezone
+ from fastapi.testclient import TestClient
+ from app.main import app
+ 
+-A = {"X-Dev-Address": "0xAAA"}
+-B = {"X-Dev-Address": "0xBBB"}
+-goal = {"name": "Trip", "amount": 100, "unlock_at": "2027-01-01T00:00:00Z", "task_id": "fh-pushups"}
++A = {"X-Dev-Address": "0x" + "a" * 40}
++B = {"X-Dev-Address": "0x" + "b" * 40}
++future = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
++goal = {"name": "Trip", "amount": 100, "unlock_at": future, "task_category": "fitness_health", "task_difficulty": "easy"}
+ 
+ with TestClient(app) as c:
+     assert c.get("/goals").status_code == 401
+-    r = c.post("/goals", json=goal, headers=A); assert r.status_code == 201, r.text
++    assert c.get("/goals", headers={"Authorization": "Bearer nope"}).status_code == 401
++    r = c.post("/goals", json={**goal, "status": "active", "user_id": 99, "amount_raw": "1"}, headers=A); assert r.status_code == 201, r.text
+     gid = r.json()["id"]
+-    # user_id in payload is ignored; B can't see/modify/delete A's goal
++    assert r.json()["status"] == "pending"  # the client cannot pick the status
++    # B can't see / touch A's goal
+     assert c.get("/goals", headers=B).json() == []
+     assert c.get(f"/goals/{gid}", headers=B).status_code == 404
+-    assert c.patch(f"/goals/{gid}", json={"name": "x"}, headers=B).status_code == 404
+     assert c.delete(f"/goals/{gid}", headers=B).status_code == 404
+-    # partial update, protected fields untouched
+-    r = c.patch(f"/goals/{gid}", json={"status": "liquidated", "user_id": 99, "id": 5}, headers=A)
+-    assert r.status_code == 200 and r.json()["status"] == "liquidated" and r.json()["id"] == gid
++    assert c.post(f"/goals/{gid}/task", headers=B).status_code == 404
++    # no generic PATCH on goals any more, and an unconfirmed goal needs the chain (not configured here)
++    assert c.patch(f"/goals/{gid}", json={"status": "liquidated"}, headers=A).status_code in (404, 405)
++    assert c.post(f"/goals/{gid}/confirm", json={}, headers=A).status_code == 503
+     # validation
+     assert c.post("/goals", json={**goal, "amount": -1}, headers=A).status_code == 422
+-    # task can't reference another user's goal
+-    assert c.post("/tasks", json={"task_id": "t", "goal_id": gid}, headers=B).status_code == 400
+-    assert c.post("/tasks", json={"task_id": "t", "goal_id": gid}, headers=A).status_code == 201
+-    # rule with json config
++    assert c.post("/goals", json={**goal, "task_category": "nope"}, headers=A).status_code == 422
++    assert c.post("/goals", json={**goal, "unlock_at": "2020-01-01T00:00:00Z"}, headers=A).status_code == 422
++    assert c.post("/goals", json={**goal, "token": "NIM"}, headers=A).status_code == 422
++    # no task without a confirmed lock
++    assert c.post(f"/goals/{gid}/task", headers=A).status_code == 409
++    # clients can't create tasks / completions
++    assert c.post("/tasks", json={"task_id": "x"}, headers=A).status_code == 405
++    assert c.get("/tasks", headers=A).json() == []
++    # rules / activity
+     r = c.post("/rules", json={"type": "api", "title": "t", "action": "a", "config": {"url": "x", "n": 1}}, headers=A)
+     assert r.status_code == 201 and r.json()["config"]["n"] == 1
+     assert c.post("/activities", json={"kind": "swap", "text": "s"}, headers=A).status_code == 201
+     assert len(c.get("/activities", headers=A).json()) == 1
++    # an unconfirmed goal can be deleted (e.g. the user rejected the lock transaction)
+     assert c.delete(f"/goals/{gid}", headers=A).status_code == 204
+-    assert c.get("/me", headers=A).json()["address"] == "0xaaa"
++    assert c.get("/me", headers=A).json()["address"] == "0x" + "a" * 40
+ print("ALL OK")
+diff --git a/contracts/USDTlock.sol b/contracts/USDTlock.sol
+index 6627c72..4b9dfa2 100644
+--- a/contracts/USDTlock.sol
++++ b/contracts/USDTlock.sol
+@@ -3,33 +3,113 @@ pragma solidity ^0.8.20;
+ 
+ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
++import "@openzeppelin/contracts/access/Ownable.sol";
++import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
++import "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+ 
+-// lock usdt / unlock usdt / view locked usdt
+-contract USDTlock {
++/**
++ * Per-goal USDT lock.
++ *
++ *  lock(goalId, amount, unlockAt)   user locks USDT for one goal (goalId is the backend's goal id)
++ *  withdraw(goalId)                 after unlockAt the funds go back to the goal's owner (anyone may trigger it)
++ *  unlockWithKey(...)               BEFORE unlockAt: needs a "task key", a signature from the trusted backend signer
++ *                                   that the backend only issues after the user passed their task. Anyone may submit
++ *                                   it (the backend relayer pays the gas); the funds ALWAYS go to the goal's owner.
++ *
++ * Goals are stored per (owner, goalId), so nobody can squat another user's goalId.
++ * Task key = EIP-191 signature (by trustedSigner) over
++ *   keccak256(abi.encodePacked(address(this), block.chainid, owner, goalId, amount, nonce, expiry))
++ * where `amount` is the amount stored on-chain for that goal, so a key can never release more than was locked.
++ */
++contract USDTlock is Ownable {
+     using SafeERC20 for IERC20;
++
++    struct Goal {
++        uint256 amount;
++        uint256 unlockAt; // unix seconds
++        bool released;
++    }
++
+     IERC20 public immutable usdt;
+-    mapping(address => uint256) private _locked;
++    address public trustedSigner;
+ 
+-    event Locked(address indexed user, uint256 amount);
+-    event Unlocked(address indexed user, uint256 amount);
++    mapping(address => mapping(uint256 => Goal)) private _goals;
++    mapping(address => uint256) private _locked; // sum of unreleased goals per user
++    mapping(bytes32 => bool) public usedNonce;
+ 
+-    constructor(address usdt_) { usdt = IERC20(usdt_); }
++    event Locked(address indexed user, uint256 indexed goalId, uint256 amount, uint256 unlockAt);
++    event Withdrawn(address indexed user, uint256 indexed goalId, uint256 amount);
++    event UnlockedWithKey(address indexed user, uint256 indexed goalId, uint256 amount, address relayer);
++    event TrustedSignerChanged(address indexed signer);
++
++    constructor(address usdt_, address trustedSigner_) Ownable(msg.sender) {
++        require(usdt_ != address(0) && trustedSigner_ != address(0), "zero addr");
++        usdt = IERC20(usdt_);
++        trustedSigner = trustedSigner_;
++        emit TrustedSignerChanged(trustedSigner_);
++    }
+ 
+-    function lockUSDT(uint256 amount) external {
++    function setTrustedSigner(address signer) external onlyOwner {
++        require(signer != address(0), "zero addr");
++        trustedSigner = signer;
++        emit TrustedSignerChanged(signer);
++    }
++
++    // ───────────── lock ─────────────
++    function lock(uint256 goalId, uint256 amount, uint256 unlockAt) external {
+         require(amount > 0, "amount=0");
++        require(unlockAt > block.timestamp, "unlockAt in the past");
++        Goal storage g = _goals[msg.sender][goalId];
++        require(g.amount == 0, "goalId used");
++
++        g.amount = amount;
++        g.unlockAt = unlockAt;
+         _locked[msg.sender] += amount;
++
+         usdt.safeTransferFrom(msg.sender, address(this), amount);
+-        emit Locked(msg.sender, amount);
++        emit Locked(msg.sender, goalId, amount, unlockAt);
+     }
+ 
+-    function unlockUSDT(uint256 amount) external {
+-        require(amount > 0 && amount <= _locked[msg.sender], "bad amount");
+-        _locked[msg.sender] -= amount;
+-        usdt.safeTransfer(msg.sender, amount);
+-        emit Unlocked(msg.sender, amount);
++    // ───────────── release paths ─────────────
++    /// Lock period is over: funds go back to `user`. No key needed; anyone may call it (e.g. a relayer).
++    function withdraw(address user, uint256 goalId) external {
++        Goal storage g = _goals[user][goalId];
++        require(g.amount > 0 && !g.released, "nothing to withdraw");
++        require(block.timestamp >= g.unlockAt, "still locked");
++        _release(user, g);
++        emit Withdrawn(user, goalId, g.amount);
+     }
+ 
++    /// Early release with a task key from the backend. Funds go to `user`, whoever sends the transaction.
++    function unlockWithKey(address user, uint256 goalId, bytes32 nonce, uint256 expiry, bytes calldata signature) external {
++        Goal storage g = _goals[user][goalId];
++        require(g.amount > 0 && !g.released, "nothing to unlock");
++        require(block.timestamp <= expiry, "key expired");
++        require(!usedNonce[nonce], "key already used");
++
++        bytes32 digest = keccak256(abi.encodePacked(address(this), block.chainid, user, goalId, g.amount, nonce, expiry));
++        address signer = ECDSA.recover(MessageHashUtils.toEthSignedMessageHash(digest), signature);
++        require(signer == trustedSigner, "bad key");
++
++        usedNonce[nonce] = true;
++        _release(user, g);
++        emit UnlockedWithKey(user, goalId, g.amount, msg.sender);
++    }
++
++    function _release(address user, Goal storage g) private {
++        uint256 amount = g.amount;
++        g.released = true; // effects before the transfer
++        _locked[user] -= amount;
++        usdt.safeTransfer(user, amount);
++    }
++
++    // ───────────── views ─────────────
+     function viewLockedUSDT(address user) external view returns (uint256) {
+         return _locked[user];
+     }
++
++    function getGoal(address user, uint256 goalId) external view returns (uint256 amount, uint256 unlockAt, bool released) {
++        Goal storage g = _goals[user][goalId];
++        return (g.amount, g.unlockAt, g.released);
++    }
+ }
+diff --git a/src/App.jsx b/src/App.jsx
+index f549569..34b64c2 100644
+--- a/src/App.jsx
++++ b/src/App.jsx
+@@ -1,4 +1,4 @@
+-import { useCallback, useState } from 'react'
++import { useCallback, useEffect, useState } from 'react'
+ import { Cpu, LayoutDashboard, RefreshCw, Settings, Target } from 'lucide-react'
+ import { ThemeProvider } from '@/hooks/useTheme'
+ import { AppProvider, useApp } from '@/context/AppContext'
+@@ -48,6 +48,11 @@ function Flow() {
+   }
+   const navigate = useCallback((to, state) => { setGoalsView(state || 'list'); setPage(to) }, [])
+ 
++  // the session ended on its own (token expired / rejected by the backend): back to sign-in instead of a blank screen
++  useEffect(() => {
++    if (step === 'app' && !wallet) { setPage('dashboard'); setStep('connect') }
++  }, [step, wallet])
++
+   if (step === 'landing') return <LaunchScreen onStart={() => setStep('connect')} />
+   if (step === 'connect') return <ConnectWallet onBack={() => setStep('landing')} onConnected={connected} />
+   if (!wallet) return null
+diff --git a/src/components/AiTask.jsx b/src/components/AiTask.jsx
+new file mode 100644
+index 0000000..7cae04a
+--- /dev/null
++++ b/src/components/AiTask.jsx
+@@ -0,0 +1,157 @@
++import { useCallback, useEffect, useRef, useState } from 'react'
++import { AlertTriangle, FileUp, Loader2, RotateCcw, Send, XCircle } from 'lucide-react'
++import { Button } from '@/components/ui/button'
++import { Card } from '@/components/ui/card'
++import { Badge } from '@/components/ui/badge'
++import { Input, Textarea } from '@/components/ui/input'
++import { haptic } from '@/hooks/useTelegram'
++import * as api from '@/lib/api'
++
++/**
++ * The AI unlock task for one goal. Replaces the old client-side TaskRunner: nothing here knows the answer.
++ *   load      GET the goal's task (or ask the backend to generate one: the AI task is created on the server)
++ *   submit    the proof (text / image / audio / video) goes to the backend, where the AI judges it
++ *   passed    the backend has already relayed the signed key to the contract; onPassed(result) says whether the funds moved
++ */
++const MAX_MB = { image: 8, audio: 24, video: 50 } // mirrors the server limits (app/task_ai.py)
++const ACCEPT = { image: 'image/*', audio: 'audio/*', video: 'video/*' }
++const HOW = {
++  text: 'Type your answer.',
++  image: 'Add a photo as proof.',
++  audio: 'Add a short voice recording as proof.',
++  video: 'Add a short video (under 3 minutes) as proof.',
++}
++
++export default function AiTask({ goal, onPassed, onCancel }) {
++  const [task, setTask] = useState(null)
++  const [phase, setPhase] = useState('loading') // loading | ready | checking | error
++  const [error, setError] = useState('')
++  const [text, setText] = useState('')
++  const [file, setFile] = useState(null)
++  const [verdict, setVerdict] = useState(null) // the last failed attempt
++  const started = useRef(false)
++  const onPassedRef = useRef(onPassed)
++  onPassedRef.current = onPassed
++
++  const load = useCallback(async () => {
++    setPhase('loading'); setError(''); setVerdict(null); setText(''); setFile(null)
++    try {
++      let t = await api.getTask(goal.id)
++      if (t?.status === 'passed') { onPassedRef.current({ passed: true, release: null }); return } // passed earlier, release still pending
++      if (!t || t.status === 'failed') t = await api.generateTask(goal.id) // a failed task is replaced by a fresh one
++      setTask(t); setPhase('ready')
++    } catch (e) {
++      setError(e.message || 'Could not load your task'); setPhase('error')
++    }
++  }, [goal.id])
++
++  useEffect(() => {
++    if (started.current) return // StrictMode runs effects twice in dev
++    started.current = true
++    load()
++  }, [load])
++
++  const type = task?.submission_type
++  const outOfAttempts = task?.status === 'failed'
++  const canSubmit = phase === 'ready' && task?.status === 'pending' && (type === 'text' ? text.trim().length > 0 : !!file)
++
++  const pickFile = (e) => {
++    const f = e.target.files?.[0]
++    if (!f) return
++    if (f.size > MAX_MB[type] * 1024 * 1024) { setError(`That file is too large (max ${MAX_MB[type]} MB).`); return }
++    setError(''); setFile(f)
++  }
++
++  const submit = async () => {
++    setPhase('checking'); setError(''); setVerdict(null)
++    try {
++      const res = await api.verifyTask(goal.id, { text: text.trim() || undefined, file })
++      if (res.passed) { haptic.success(); onPassedRef.current(res); return }
++      haptic.error()
++      setTask((t) => ({ ...t, status: res.status, attempts: t.max_attempts - res.attempts_left }))
++      setVerdict(res); setFile(null); setPhase('ready')
++    } catch (e) {
++      haptic.error(); setError(e.message || 'Could not check your proof'); setPhase('ready')
++    }
++  }
++
++  if (phase === 'loading') {
++    return (
++      <Card className="flex flex-col items-center gap-3 rounded-3xl p-8 text-center">
++        <Loader2 size={30} className="animate-spin text-primary" />
++        <p className="text-sm font-semibold">Getting your task…</p>
++        <p className="text-xs text-muted-foreground">The AI is writing it for you.</p>
++      </Card>
++    )
++  }
++
++  if (phase === 'error' && !task) {
++    return (
++      <Card className="space-y-3 rounded-3xl p-6 text-center">
++        <AlertTriangle size={30} className="mx-auto text-destructive" />
++        <p className="break-words text-sm font-semibold">{error}</p>
++        <div className="flex gap-2">
++          <Button variant="outline" className="flex-1" onClick={onCancel}>Back</Button>
++          <Button className="flex-1" onClick={load}>Try again</Button>
++        </div>
++      </Card>
++    )
++  }
++
++  return (
++    <Card className="animate-fade-in space-y-4 rounded-3xl border-primary/30 p-5">
++      <div className="flex items-center justify-between">
++        <Badge variant="muted">{task.difficulty}</Badge>
++        <span className="text-[11px] font-semibold text-muted-foreground">
++          {outOfAttempts ? 'No attempts left' : `Attempt ${Math.min(task.attempts + 1, task.max_attempts)} of ${task.max_attempts}`}
++        </span>
++      </div>
++
++      <div className="space-y-1.5">
++        <h4 className="text-base font-extrabold">{task.title}</h4>
++        <p className="whitespace-pre-wrap text-sm leading-relaxed text-muted-foreground">{task.description}</p>
++      </div>
++
++      {verdict && (
++        <div className="flex items-start gap-2 rounded-2xl bg-destructive/10 p-3 text-xs font-medium text-destructive">
++          <XCircle size={15} className="mt-0.5 shrink-0" />
++          <span className="min-w-0 break-words">{verdict.feedback || 'That did not pass.'}</span>
++        </div>
++      )}
++
++      {outOfAttempts ? (
++        <Button className="w-full" onClick={load}><RotateCcw size={16} /> Get a new task</Button>
++      ) : (
++        <>
++          <p className="text-xs font-semibold text-muted-foreground">{HOW[type] || HOW.text}</p>
++
++          {type === 'text' ? (
++            <Textarea value={text} onChange={(e) => setText(e.target.value)} placeholder="Your answer…" disabled={phase === 'checking'} className="font-sans" />
++          ) : (
++            <div className="space-y-2">
++              <label className="flex cursor-pointer items-center justify-center gap-2 rounded-2xl border border-dashed p-4 text-sm font-semibold text-primary active:scale-[0.98]">
++                <FileUp size={17} /> {file ? file.name : 'Choose or record a file'}
++                <input type="file" accept={ACCEPT[type]} onChange={pickFile} disabled={phase === 'checking'} className="hidden" />
++              </label>
++              {file && <p className="text-center text-[11px] text-muted-foreground">{(file.size / 1024 / 1024).toFixed(1)} MB</p>}
++              <Input value={text} onChange={(e) => setText(e.target.value)} placeholder="Add a note (optional)" disabled={phase === 'checking'} />
++            </div>
++          )}
++
++          {error && <p className="break-words text-center text-xs font-medium text-destructive">{error}</p>}
++
++          <Button size="lg" className="w-full" disabled={!canSubmit} onClick={submit}>
++            {phase === 'checking'
++              ? <><Loader2 size={17} className="animate-spin" /> Checking your proof…</>
++              : <><Send size={16} /> Submit for review</>}
++          </Button>
++          {phase === 'checking' && <p className="text-center text-[11px] text-muted-foreground">This can take up to a minute. If you pass, your funds are released straight to your wallet.</p>}
++        </>
++      )}
++
++      <Button variant="ghost" size="sm" className="w-full text-muted-foreground" disabled={phase === 'checking'} onClick={onCancel}>
++        Cancel
++      </Button>
++    </Card>
++  )
++}
+diff --git a/src/components/TaskRunner.jsx b/src/components/TaskRunner.jsx
+deleted file mode 100644
+index 295e743..0000000
+--- a/src/components/TaskRunner.jsx
++++ /dev/null
+@@ -1,157 +0,0 @@
+-import { useEffect, useRef, useState } from 'react'
+-import { Check, CheckCircle2, Eye, Minus, Plus, Play, RotateCcw, XCircle } from 'lucide-react'
+-import { Button } from '@/components/ui/button'
+-import { Input } from '@/components/ui/input'
+-import { Progress } from '@/components/ui/progress'
+-import { cn } from '@/lib/utils'
+-import { haptic } from '@/hooks/useTelegram'
+-
+-/** Renders the right mini-game for a task and calls onComplete() when it is passed. */
+-export default function TaskRunner({ task, onComplete }) {
+-  const { type, config } = task
+-  const props = { config, onComplete }
+-  switch (type) {
+-    case 'quiz': return <Quiz {...props} />
+-    case 'memory': return <Memory {...props} />
+-    case 'timer': return <TimerTask {...props} />
+-    case 'counter': return <Counter {...props} />
+-    case 'checklist': return <Checklist {...props} />
+-    default: return null
+-  }
+-}
+-
+-function Quiz({ config, onComplete }) {
+-  const [picked, setPicked] = useState(null)
+-  const correct = picked === config.answer
+-  const pick = (i) => {
+-    if (correct) return
+-    setPicked(i)
+-    i === config.answer ? haptic.success() : haptic.error()
+-  }
+-  return (
+-    <div className="space-y-3">
+-      <p className="text-sm font-semibold leading-relaxed">{config.question}</p>
+-      <div className="space-y-2">
+-        {config.options.map((o, i) => (
+-          <button
+-            key={o}
+-            onClick={() => pick(i)}
+-            className={cn(
+-              'flex w-full items-center justify-between rounded-xl border p-3 text-left text-sm font-medium transition-all active:scale-[0.98]',
+-              picked === i && (i === config.answer ? 'border-success bg-success/10' : 'border-destructive bg-destructive/10'),
+-            )}
+-          >
+-            {o}
+-            {picked === i && (i === config.answer ? <CheckCircle2 size={16} className="text-success" /> : <XCircle size={16} className="text-destructive" />)}
+-          </button>
+-        ))}
+-      </div>
+-      {picked !== null && !correct && <p className="text-xs font-medium text-destructive">Not quite — try again.</p>}
+-      <Button className="w-full" disabled={!correct} onClick={onComplete}>Task complete · Unlock funds</Button>
+-    </div>
+-  )
+-}
+-
+-function Memory({ config, onComplete }) {
+-  const [phase, setPhase] = useState('ready') // ready | show | recall | fail
+-  const [answer, setAnswer] = useState('')
+-  const isNum = config.sequence.every((s) => /^\d$/.test(s))
+-  const start = () => { setPhase('show'); setAnswer(''); setTimeout(() => setPhase('recall'), config.showMs) }
+-  const check = () => {
+-    const expected = config.sequence.join(isNum ? '' : ' ').toLowerCase()
+-    const got = answer.trim().toLowerCase().replace(isNum ? /\s+/g : /[\s,]+/g, isNum ? '' : ' ')
+-    if (got === expected) { haptic.success(); onComplete() } else { haptic.error(); setPhase('fail') }
+-  }
+-  return (
+-    <div className="space-y-3">
+-      {phase === 'ready' && (
+-        <>
+-          <p className="text-sm text-muted-foreground">You will see {config.sequence.length} items for {config.showMs / 1000}s. Memorise them in order, then type them back.</p>
+-          <Button className="w-full" onClick={start}><Eye size={16} /> Show sequence</Button>
+-        </>
+-      )}
+-      {phase === 'show' && (
+-        <div className="flex flex-wrap justify-center gap-2 rounded-2xl bg-muted p-6">
+-          {config.sequence.map((s, i) => (
+-            <span key={i} className="rounded-xl bg-card px-4 py-3 font-mono text-lg font-bold text-primary shadow-sm">{s}</span>
+-          ))}
+-        </div>
+-      )}
+-      {phase === 'recall' && (
+-        <>
+-          <p className="text-sm font-semibold">Type the sequence {isNum ? '(digits only)' : '(separate with spaces)'}</p>
+-          <Input autoFocus value={answer} onChange={(e) => setAnswer(e.target.value)} inputMode={isNum ? 'numeric' : 'text'} placeholder="…" className="font-mono text-lg tracking-widest" />
+-          <Button className="w-full" disabled={!answer} onClick={check}>Submit</Button>
+-        </>
+-      )}
+-      {phase === 'fail' && (
+-        <>
+-          <p className="text-sm font-medium text-destructive">That wasn’t right. Give it another go.</p>
+-          <Button variant="outline" className="w-full" onClick={() => setPhase('ready')}><RotateCcw size={16} /> Try again</Button>
+-        </>
+-      )}
+-    </div>
+-  )
+-}
+-
+-function TimerTask({ config, onComplete }) {
+-  const [left, setLeft] = useState(config.seconds)
+-  const [running, setRunning] = useState(false)
+-  const done = left === 0
+-  useEffect(() => {
+-    if (!running) return
+-    const t = setInterval(() => setLeft((l) => Math.max(0, l - 1)), 1000)
+-    return () => clearInterval(t)
+-  }, [running])
+-  useEffect(() => { if (done) { setRunning(false); haptic.success() } }, [done])
+-  const mm = String(Math.floor(left / 60)).padStart(2, '0')
+-  const ss = String(left % 60).padStart(2, '0')
+-  return (
+-    <div className="space-y-4 text-center">
+-      <div className="font-mono text-5xl font-bold tracking-tight text-primary">{mm}:{ss}</div>
+-      <Progress value={((config.seconds - left) / config.seconds) * 100} />
+-      {!done && (
+-        <Button className="w-full" variant={running ? 'outline' : 'default'} onClick={() => setRunning((r) => !r)}>
+-          {running ? config.verb + '…' : <><Play size={16} /> {left === config.seconds ? 'Start' : 'Resume'}</>}
+-        </Button>
+-      )}
+-      <Button className="w-full" disabled={!done} onClick={onComplete}>Task complete · Unlock funds</Button>
+-    </div>
+-  )
+-}
+-
+-function Counter({ config, onComplete }) {
+-  const [n, setN] = useState(0)
+-  const done = n >= config.target
+-  const bump = (d) => { setN((v) => Math.min(config.target, Math.max(0, v + d))); haptic.tap() }
+-  return (
+-    <div className="space-y-4 text-center">
+-      <p className="text-xs font-bold uppercase tracking-wider text-muted-foreground">{config.unit}</p>
+-      <div className="font-mono text-6xl font-bold text-primary">{n}<span className="text-2xl text-muted-foreground">/{config.target}</span></div>
+-      <Progress value={(n / config.target) * 100} />
+-      <div className="flex gap-2">
+-        <Button variant="outline" size="icon" className="h-14 w-14" onClick={() => bump(-1)}><Minus size={18} /></Button>
+-        <Button className="h-14 flex-1 text-base" disabled={done} onClick={() => bump(1)}><Plus size={18} /> Count rep</Button>
+-      </div>
+-      <Button className="w-full" disabled={!done} onClick={onComplete}>Task complete · Unlock funds</Button>
+-    </div>
+-  )
+-}
+-
+-function Checklist({ config, onComplete }) {
+-  const [ticked, setTicked] = useState([])
+-  const toggle = (i) => { haptic.select(); setTicked((t) => (t.includes(i) ? t.filter((x) => x !== i) : [...t, i])) }
+-  return (
+-    <div className="space-y-3">
+-      {config.steps.map((s, i) => (
+-        <button key={s} onClick={() => toggle(i)} className="flex w-full items-center gap-3 rounded-xl border p-3 text-left text-sm font-medium active:scale-[0.98]">
+-          <span className={cn('flex h-5 w-5 items-center justify-center rounded-md border', ticked.includes(i) && 'border-primary bg-primary text-white')}>
+-            {ticked.includes(i) && <Check size={13} />}
+-          </span>
+-          <span className={cn(ticked.includes(i) && 'text-muted-foreground line-through')}>{s}</span>
+-        </button>
+-      ))}
+-      <Button className="w-full" disabled={ticked.length < config.steps.length} onClick={onComplete}>Task complete · Unlock funds</Button>
+-    </div>
+-  )
+-}
+diff --git a/src/context/AppContext.jsx b/src/context/AppContext.jsx
+index a0d63a9..e172308 100644
+--- a/src/context/AppContext.jsx
++++ b/src/context/AppContext.jsx
+@@ -1,14 +1,18 @@
+ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
+ import { DAY } from '@/lib/utils'
+ import { useBalances } from '@/hooks/useBalances'
+-import { lockUSDT, unlockUSDT } from '@/contracts'
++import { lockGoal, unlockWithKey, withdrawGoal } from '@/contracts'
++import { clearSession } from '@/lib/auth'
+ import * as api from '@/lib/api'
+ 
+ /**
+  * App state.
+- *  - Money movement (lock / unlock) goes on-chain via src/contracts.js.
+- *  - Goal metadata, automation rules, activity and task completions live in the FastAPI backend (src/lib/api.js).
+- *    Nothing is persisted in localStorage any more.
++ *  - Sign-in: wallet signature -> JWT (src/lib/auth.js). Every request carries it; a 401 logs the user out.
++ *  - Money moves on-chain (src/contracts.js). Goals mirror the contract: the backend READS the contract before it marks
++ *    a goal active or liquidated, so the UI only ever shows what the chain says.
++ *  - Goal lifecycle: create (pending) -> user locks on-chain -> backend confirms -> active -> released.
++ *    Early release = pass the AI task -> the backend relays the signed key to the contract (components/AiTask.jsx).
++ *  - Rules, activity and task completions live in the FastAPI backend. Nothing is persisted in localStorage.
+  */
+ const AppCtx = createContext(null)
+ 
+@@ -22,13 +26,27 @@ function streakOf(times) {
+   while (days.has(d)) { n += 1; d -= 1 }
+   return n
+ }
+-const errText = (e) => e?.message || 'Request failed'
++const errText = (e) => e?.shortMessage || e?.reason || e?.message || 'Request failed'
++const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
++
++/** The chain can lag a few seconds behind the wallet's confirmation, so ask the backend to confirm a few times. */
++async function confirmWithRetry(id, txHash) {
++  let last
++  for (let i = 0; i < 5; i += 1) {
++    try { return await api.confirmGoal(id, txHash) } catch (e) {
++      last = e
++      if (e.status !== 409 && e.status !== 503 && e.status !== undefined) break // a real rejection: don't hammer it
++      await sleep(2500)
++    }
++  }
++  throw last
++}
+ 
+ export function AppProvider({ children }) {
+-  const [wallet, setWallet] = useState(null) // from connectNimiqPay()
++  const [wallet, setWallet] = useState(null) // from connectNimiqPay(), plus { user } after sign-in
+   const balances = useBalances(wallet)
+ 
+-  const [goals, setGoals] = useState([])
++  const [allGoals, setAllGoals] = useState([]) // includes `pending` rows (lock sent, not confirmed yet)
+   const [conditions, setConditions] = useState([])
+   const [activity, setActivity] = useState([])
+   const [taskTimes, setTaskTimes] = useState([]) // completion timestamps (ms)
+@@ -36,31 +54,58 @@ export function AppProvider({ children }) {
+   const [syncError, setSyncError] = useState(null) // shown as a banner when the backend is unreachable / a save failed
+ 
+   const owner = wallet ? wallet.evmAddress || wallet.address : null
++  const live = !!wallet && !wallet.demo // the demo wallet (dev only) has no keys: it can browse but not move money
++
++  // goals the user should see: unconfirmed rows stay hidden until the backend finds the lock on-chain
++  const goals = useMemo(() => allGoals.filter((g) => g.status !== 'pending'), [allGoals])
++  const goalsRef = useRef(allGoals)
++  goalsRef.current = allGoals
++
++  const upsertGoal = useCallback((row) => setAllGoals((gs) => (gs.some((g) => g.id === row.id) ? gs.map((g) => (g.id === row.id ? row : g)) : [row, ...gs])), [])
+ 
+   // ---- load everything for this user from the backend ----
+   const load = useCallback(async () => {
+     const [g, r, a, t] = await Promise.all([api.listGoals(), api.listRules(), api.listActivity(), api.listTaskCompletions()])
+-    setGoals(g); setConditions(r); setActivity(a); setTaskTimes(t.map((x) => x.at))
++    setAllGoals(g); setConditions(r); setActivity(a); setTaskTimes(t.map((x) => x.at).filter(Boolean))
++
++    // Reconcile with the chain (best effort): a lock whose confirmation never came back, or a withdraw done in the wallet.
++    const now = Date.now()
++    const fixes = g.filter((x) => x.status === 'pending' || (x.status === 'active' && x.unlockAt <= now))
++    if (fixes.length) {
++      const rows = await Promise.all(fixes.map((x) => (x.status === 'pending' ? api.confirmGoal(x.id) : api.syncGoal(x.id)).catch(() => x)))
++      setAllGoals((cur) => cur.map((x) => rows.find((r2) => r2.id === x.id) || x))
++      if (rows.some((x, i) => x.status !== fixes[i].status)) api.listActivity().then(setActivity).catch(() => {})
++    }
++  }, [])
++
++  // session: a 401 means the token expired or was revoked, so go back to the sign-in screen
++  useEffect(() => {
++    api.setUnauthorizedHandler(() => { clearSession(); setWallet(null) })
++    return () => api.setUnauthorizedHandler(null)
+   }, [])
+ 
+   useEffect(() => {
+     setLoaded(false); setSyncError(null)
+-    if (!owner) { api.setAuth(null); setGoals([]); setConditions([]); setActivity([]); setTaskTimes([]); return }
+-    api.setAuth({ devAddress: owner }) // swap for { token } when wallet-signature login is added
++    if (!owner) { clearSession(); setAllGoals([]); setConditions([]); setActivity([]); setTaskTimes([]); return }
++    if (wallet.demo) api.setAuth({ devAddress: owner }) // dev header, needs AUTH_DEV_MODE=1 on the backend
++    // a real wallet already has its token: lib/auth.js set it during sign-in
+     let cancelled = false
+     load()
+       .catch((e) => !cancelled && setSyncError(`Could not load your data: ${errText(e)}`))
+       .finally(() => !cancelled && setLoaded(true))
+     return () => { cancelled = true }
++    // eslint-disable-next-line react-hooks/exhaustive-deps
+   }, [owner, load])
+ 
+   const stats = useMemo(() => ({ tasksDone: taskTimes.length, streak: streakOf(taskTimes) }), [taskTimes])
+ 
+-  const goalsRef = useRef(goals)
+-  goalsRef.current = goals
+-  const live = !!wallet && !wallet.demo // demo wallet (dev only) skips the chain
++  /** Pull the server's view again after anything that moved money or changed a task. */
++  const refreshAll = useCallback(async () => {
++    try { await load(); setSyncError(null) } catch (e) { setSyncError(errText(e)) }
++    balances.refresh()
++  }, [load, balances])
+ 
+-  /** Add an activity line: shows instantly, then saves to the backend. */
++  /** Add an activity line for client-side events (swap, send, rule). Lock / unlock lines are written by the server. */
+   const log = useCallback((kind, text, txHash) => {
+     const tempId = `tmp-${Date.now()}-${Math.random()}`
+     setActivity((a) => [{ id: tempId, kind, text, txHash: txHash ?? null, at: Date.now() }, ...a].slice(0, 50))
+@@ -69,40 +114,56 @@ export function AppProvider({ children }) {
+       .catch((e) => setSyncError(`Could not save activity: ${errText(e)}`))
+   }, [])
+ 
+-  /** Locks USDT on-chain, then saves the goal. Throws only if the lock transaction itself fails. */
++  /**
++   * New goal: create the row (pending) -> lock on-chain under that row's id -> backend confirms from the contract.
++   * Throws if the row can't be created or the user rejects / fails the lock transaction (the pending row is removed).
++   */
+   const addGoal = useCallback(async (g) => {
+-    let txHash = null
+-    if (live) txHash = (await lockUSDT(g.amount))?.hash ?? null
+-    const draft = { token: 'USDT', ...g, txHash }
++    if (!live) throw new Error('The demo wallet cannot lock funds. Open the app inside Nimiq Pay.')
++    const draft = await api.createGoal({ ...g, token: 'USDT' })
++    let receipt
+     try {
+-      const row = await api.createGoal(draft)
+-      setGoals((gs) => [row, ...gs])
++      receipt = await lockGoal(draft.id, g.amount, draft.unlockAt)
+     } catch (e) {
+-      // funds ARE locked but the record didn't save: keep it visible locally and tell the user
+-      setGoals((gs) => [{ id: `local-${Date.now()}`, createdAt: Date.now(), status: 'active', unsynced: true, ...draft }, ...gs])
+-      setSyncError(`Funds are locked on-chain but the goal was not saved (${errText(e)}).`)
+-    }
+-    log('lock', `Locked $${Number(g.amount).toLocaleString()} into ${g.name}`, txHash)
+-    balances.refresh()
+-  }, [live, log, balances])
+-
+-  /** Unlocks the goal's USDT on-chain, then marks it liquidated (and records the task if it was an early release). */
+-  const liquidateGoal = useCallback(async (id, viaTask) => {
+-    const g = goalsRef.current.find((x) => x.id === id)
+-    if (!g) return
+-    if (live) await unlockUSDT(g.amount)
+-    setGoals((gs) => gs.map((x) => (x.id === id ? { ...x, status: 'liquidated', liquidatedAt: Date.now() } : x)))
+-    log('unlock', `Liquidated ${g.name} · $${Number(g.amount).toLocaleString()} released`)
+-    if (!g.unsynced) {
+-      api.markGoalLiquidated(id).catch((e) => setSyncError(`Funds released, but the goal status was not saved: ${errText(e)}`))
++      api.deleteGoal(draft.id).catch(() => {}) // nothing was locked, drop the pending row
++      throw e
+     }
+-    if (viaTask) {
+-      setTaskTimes((t) => [...t, Date.now()])
+-      api.recordTaskCompletion({ taskId: g.taskId, goalId: g.unsynced ? null : id })
+-        .catch((e) => setSyncError(`Could not save task completion: ${errText(e)}`))
++    try {
++      upsertGoal(await confirmWithRetry(draft.id, receipt?.hash))
++    } catch (e) {
++      upsertGoal(draft) // stays pending; load() retries the confirmation next time the app opens
++      setSyncError(`Your USDT is locked on-chain, but the app could not confirm it yet (${errText(e)}). It will retry automatically.`)
+     }
++    api.listActivity().then(setActivity).catch(() => {})
++    balances.refresh()
++  }, [live, balances, upsertGoal])
++
++  /** After the lock period: the user withdraws from the contract themselves (their wallet, their gas), then the backend syncs. */
++  const withdrawGoalNow = useCallback(async (id) => {
++    if (!live) throw new Error('The demo wallet cannot move funds.')
++    await withdrawGoal(id)
++    try { upsertGoal(await api.syncGoal(id)) } catch (e) { setSyncError(`Funds released, but the app could not update the goal yet (${errText(e)}).`) }
++    api.listActivity().then(setActivity).catch(() => {})
+     balances.refresh()
+-  }, [live, log, balances])
++  }, [live, balances, upsertGoal])
++
++  /** Early release, retry: ask the backend to relay the passed task's key to the contract again. Returns { released, error }. */
++  const retryRelease = useCallback(async (id) => {
++    const r = await api.releaseGoal(id)
++    upsertGoal(r.goal)
++    if (r.released) await refreshAll()
++    return r
++  }, [refreshAll, upsertGoal])
++
++  /** Early release, fallback: submit the signed task key from the user's own wallet (they pay the gas). */
++  const selfUnlock = useCallback(async (id) => {
++    const goal = goalsRef.current.find((x) => x.id === id)
++    if (!goal || !owner) return
++    const key = await api.getUnlockKey(id)
++    await unlockWithKey(owner, id, key)
++    upsertGoal(await api.syncGoal(id))
++    await refreshAll()
++  }, [owner, refreshAll, upsertGoal])
+ 
+   /** Saves a rule. Throws if the backend rejects it. */
+   const addCondition = useCallback(async (c) => {
+@@ -131,8 +192,15 @@ export function AppProvider({ children }) {
+   }, [conditions])
+ 
+   const value = useMemo(
+-    () => ({ wallet, setWallet, live, balances, goals, addGoal, liquidateGoal, conditions, addCondition, toggleCondition, removeCondition, activity, log, stats, loaded, syncError, clearSyncError: () => setSyncError(null), reload: () => load().then(() => setSyncError(null)).catch((e) => setSyncError(errText(e))) }),
+-    [wallet, live, balances, goals, addGoal, liquidateGoal, conditions, addCondition, toggleCondition, removeCondition, activity, log, stats, loaded, syncError, load],
++    () => ({
++      wallet, setWallet, live, balances,
++      goals, addGoal, withdrawGoalNow, retryRelease, selfUnlock, refreshAll,
++      conditions, addCondition, toggleCondition, removeCondition,
++      activity, log, stats, loaded, syncError,
++      clearSyncError: () => setSyncError(null),
++      reload: () => load().then(() => setSyncError(null)).catch((e) => setSyncError(errText(e))),
++    }),
++    [wallet, live, balances, goals, addGoal, withdrawGoalNow, retryRelease, selfUnlock, refreshAll, conditions, addCondition, toggleCondition, removeCondition, activity, log, stats, loaded, syncError, load],
+   )
+   return <AppCtx.Provider value={value}>{children}</AppCtx.Provider>
+ }
+diff --git a/src/contracts.js b/src/contracts.js
+index d894d79..0dc2bc9 100644
+--- a/src/contracts.js
++++ b/src/contracts.js
+@@ -48,22 +48,41 @@ export async function mintTestTokens(token, amount) {
+   await (await c.faucet(toRaw(amount, token))).wait();
+ }
+ 
+-// ---------- LOCK / UNLOCK / VIEW ----------
+-export async function lockUSDT(amount) {
++// ---------- sign-in ----------
++/** personal_sign of the backend's login message. It proves wallet ownership and moves no funds. */
++export async function signMessage(message) {
++  return (await signer()).signMessage(message);
++}
++
++// ---------- LOCK (per goal) ----------
++function lockContract(s) {
++  if (!ADDRESSES.LOCK) throw new Error("Lock contract not set. Deploy USDTlock and put its address in VITE_LOCK_ADDRESS.");
++  return new Contract(ADDRESSES.LOCK, LOCK_ABI, s);
++}
++
++/** Lock USDT for goal `goalId` (the backend's goal id) until `unlockAtMs`. Asks for an approve first if needed. */
++export async function lockGoal(goalId, amount, unlockAtMs) {
+   const raw = toRaw(amount, "USDT");
+   await ensureAllowance("USDT", ADDRESSES.LOCK, raw);
+-  const c = new Contract(ADDRESSES.LOCK, LOCK_ABI, await signer());
+-  return (await c.lockUSDT(raw)).wait();
++  const c = lockContract(await signer());
++  return (await c.lock(goalId, raw, BigInt(Math.floor(unlockAtMs / 1000)))).wait();
++}
++
++/** After the lock period: the contract pays the goal's owner. The user signs and pays the gas for this one. */
++export async function withdrawGoal(goalId) {
++  const s = await signer();
++  return (await lockContract(s).withdraw(await s.getAddress(), goalId)).wait();
+ }
+ 
+-export async function unlockUSDT(amount) {
+-  const c = new Contract(ADDRESSES.LOCK, LOCK_ABI, await signer());
+-  return (await c.unlockUSDT(toRaw(amount, "USDT"))).wait();
++/** Fallback only: submit a task key yourself (you pay the gas) if the backend's relayer could not. Funds still go to the owner. */
++export async function unlockWithKey(user, goalId, key) {
++  const c = lockContract(await signer());
++  return (await c.unlockWithKey(user, goalId, key.nonce, key.expiry, key.signature)).wait();
+ }
+ 
+ export async function viewLockedUSDT() {
+   const s = await signer();
+-  const c = new Contract(ADDRESSES.LOCK, LOCK_ABI, s);
++  const c = lockContract(s);
+   return fromRaw(await c.viewLockedUSDT(await s.getAddress()), "USDT");
+ }
+ 
+diff --git a/src/lib/api.js b/src/lib/api.js
+index 3b403c9..1ad658e 100644
+--- a/src/lib/api.js
++++ b/src/lib/api.js
+@@ -1,42 +1,98 @@
+ /**
+  * HTTP client for the Nimlock FastAPI backend.
+- * Base URL: VITE_API_URL (e.g. http://localhost:8000). Auth is set once per session with setAuth().
++ * Base URL: VITE_API_URL (e.g. http://localhost:8000).
++ * Auth: setAuth({ token }) after the wallet-signature login (lib/auth.js). setAuth({ devAddress }) is the dev header
++ * (backend needs AUTH_DEV_MODE=1, and it is only sent by dev builds).
+  */
+ const BASE = (import.meta.env.VITE_API_URL || 'http://localhost:8000').replace(/\/$/, '')
+ 
+ let auth = { token: null, devAddress: null }
+-/** setAuth({ token }) once wallet-signature login exists; setAuth({ devAddress }) for the dev header (backend needs AUTH_DEV_MODE=1). */
++let unauthorizedHandler = null
+ export const setAuth = (a) => { auth = { token: a?.token ?? null, devAddress: a?.devAddress ?? null } }
++/** Called when a request that carried a token comes back 401 (expired / invalid session). */
++export const setUnauthorizedHandler = (fn) => { unauthorizedHandler = fn }
++
++const detailText = (d, status) => {
++  if (typeof d === 'string' && d) return d
++  if (Array.isArray(d) && d.length) return d.map((x) => x?.msg).filter(Boolean).join(', ')
++  return `API ${status}`
++}
+ 
+ async function request(method, path, body) {
+-  const headers = { 'Content-Type': 'application/json' }
++  const headers = {}
+   if (auth.token) headers.Authorization = `Bearer ${auth.token}`
+   else if (import.meta.env.DEV && auth.devAddress) headers['X-Dev-Address'] = auth.devAddress
+ 
+-  const res = await fetch(`${BASE}${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) })
++  let payload
++  if (body instanceof FormData) payload = body // the browser sets the multipart boundary itself
++  else if (body !== undefined) { headers['Content-Type'] = 'application/json'; payload = JSON.stringify(body) }
++
++  const hadToken = !!auth.token
++  const res = await fetch(`${BASE}${path}`, { method, headers, body: payload })
+   if (!res.ok) {
+     let detail = ''
+     try { detail = (await res.json()).detail } catch { /* not json */ }
+-    const err = new Error(typeof detail === 'string' && detail ? detail : `API ${res.status}`)
++    const err = new Error(detailText(detail, res.status))
+     err.status = res.status
++    if (res.status === 401 && hadToken) unauthorizedHandler?.()
+     throw err
+   }
+   return res.status === 204 ? null : res.json()
+ }
+ 
+ // ---- mapping: backend (snake_case, ISO dates) <-> frontend (camelCase, ms timestamps) ----
+-const ts = (s) => (s ? Date.parse(s) : null)
++// The API sends UTC; a timestamp without a zone marker is treated as UTC (never as the phone's local time).
++const ts = (s) => (s ? Date.parse(/(Z|[+-]\d\d:?\d\d)$/.test(s) ? s : `${s}Z`) : null)
+ const iso = (ms) => new Date(ms).toISOString()
+ 
+-const goalIn = (g) => ({ id: g.id, name: g.name, amount: g.amount, token: g.token, status: g.status, taskId: g.task_id, txHash: g.tx_hash, createdAt: ts(g.created_at), unlockAt: ts(g.unlock_at), liquidatedAt: ts(g.liquidated_at) })
++const goalIn = (g) => ({
++  id: g.id, name: g.name, amount: g.amount, token: g.token, status: g.status,
++  taskCategory: g.task_category, taskDifficulty: g.task_difficulty,
++  txHash: g.tx_hash, releaseTxHash: g.release_tx_hash,
++  createdAt: ts(g.created_at), unlockAt: ts(g.unlock_at), liquidatedAt: ts(g.liquidated_at),
++})
+ const activityIn = (a) => ({ id: a.id, kind: a.kind, text: a.text, txHash: a.tx_hash, at: ts(a.created_at) })
+-const taskIn = (t) => ({ id: t.id, taskId: t.task_id, goalId: t.goal_id, at: ts(t.completed_at) })
++const taskIn = (t) => ({ id: t.id, goalId: t.goal_id, category: t.category, at: ts(t.completed_at) })
+ 
+-// ---- goals ----
++// ---- auth (wallet signature login) ----
++export const getNonce = (address) => request('GET', `/auth/nonce?address=${encodeURIComponent(address)}`)
++export const login = (address, signature) => request('POST', '/auth/login', { address, signature })
++export const createUser = ({ address, username, signature, nimAddress }) =>
++  request('POST', '/auth/create_user', { address, username, signature, nim_address: nimAddress ?? null })
++export const me = () => request('GET', '/me')
++
++// ---- goals: create (pending) -> lock on-chain -> confirm (the backend reads the contract) ----
+ export const listGoals = async () => (await request('GET', '/goals?limit=500')).map(goalIn)
+ export const createGoal = async (g) =>
+-  goalIn(await request('POST', '/goals', { name: g.name, amount: g.amount, token: g.token, unlock_at: iso(g.unlockAt), task_id: g.taskId, tx_hash: g.txHash ?? null }))
+-export const markGoalLiquidated = async (id) => goalIn(await request('PATCH', `/goals/${id}`, { status: 'liquidated', liquidated_at: iso(Date.now()) }))
++  goalIn(await request('POST', '/goals', { name: g.name, amount: g.amount, token: g.token, unlock_at: iso(g.unlockAt), task_category: g.taskCategory, task_difficulty: g.taskDifficulty }))
++export const deleteGoal = (id) => request('DELETE', `/goals/${id}`) // only allowed while unconfirmed
++export const confirmGoal = async (id, txHash) => goalIn(await request('POST', `/goals/${id}/confirm`, { tx_hash: txHash ?? null }))
++/** After the user's own on-chain withdraw: the backend reads the contract and marks the goal liquidated. */
++export const syncGoal = async (id) => goalIn(await request('POST', `/goals/${id}/sync`))
++/** Retry the backend -> contract release for a goal whose task was passed. */
++export const releaseGoal = async (id) => {
++  const r = await request('POST', `/goals/${id}/release`)
++  return { released: r.released, txHash: r.tx_hash, error: r.error, goal: goalIn(r.goal) }
++}
++
++// ---- AI unlock tasks ----
++/** The goal's latest task, or null when none exists yet. The answer key never reaches the client. */
++export const getTask = async (goalId) => {
++  try { return await request('GET', `/goals/${goalId}/task`) } catch (e) { if (e.status === 404) return null; throw e }
++}
++/** Returns the goal's live task, asking the AI for a new one if there is none (or the last one was failed). The task
++ *  category and difficulty are the ones chosen when the goal was created. */
++export const generateTask = (goalId) => request('POST', `/goals/${goalId}/task`)
++/** Fallback only: the signed task key, so the user can submit it from their own wallet if the backend relayer is down. */
++export const getUnlockKey = (goalId) => request('GET', `/goals/${goalId}/unlock-key`)
++/** Submit proof. `file` is an image / audio / video File, `text` the typed answer or note. */
++export const verifyTask = (goalId, { text, file }) => {
++  const fd = new FormData()
++  if (text) fd.append('text', text)
++  if (file) fd.append('file', file)
++  return request('POST', `/goals/${goalId}/task/verify`, fd)
++}
++export const listTaskCompletions = async () => (await request('GET', '/tasks?limit=500')).map(taskIn)
+ 
+ // ---- rules (conditions / Automate): backend shape already matches the UI ----
+ export const listRules = () => request('GET', '/rules?limit=500')
+@@ -44,10 +100,6 @@ export const createRule = (r) => request('POST', '/rules', r)
+ export const setRuleEnabled = (id, enabled) => request('PATCH', `/rules/${id}`, { enabled })
+ export const deleteRule = (id) => request('DELETE', `/rules/${id}`)
+ 
+-// ---- activity ----
++// ---- activity (lock / unlock rows are written by the server; swap / send / rule by the client) ----
+ export const listActivity = async () => (await request('GET', '/activities?limit=50')).map(activityIn)
+ export const createActivity = async ({ kind, text, txHash }) => activityIn(await request('POST', '/activities', { kind, text, tx_hash: txHash ?? null }))
+-
+-// ---- task completions (drives the "tasks done" and "streak" stats) ----
+-export const listTaskCompletions = async () => (await request('GET', '/tasks?limit=500')).map(taskIn)
+-export const recordTaskCompletion = async ({ taskId, goalId }) => taskIn(await request('POST', '/tasks', { task_id: taskId, goal_id: goalId ?? null }))
+diff --git a/src/lib/auth.js b/src/lib/auth.js
+new file mode 100644
+index 0000000..2272256
+--- /dev/null
++++ b/src/lib/auth.js
+@@ -0,0 +1,49 @@
++/**
++ * Wallet-signature login against the backend.
++ *   signIn(evmAddress)  -> reuse a saved session if it is still valid, else: nonce -> wallet signs -> POST /auth/login
++ *                          returns { token, user }, or { needsUsername, signature } when this wallet has no account yet
++ *   register(...)       -> POST /auth/create_user with the SAME signature (the backend did not burn the nonce on the 404)
++ * The token lives in sessionStorage (gone when the app closes) and in memory (api.js). Nothing else is persisted.
++ */
++import * as api from '@/lib/api'
++import { signMessage } from '@/contracts'
++
++const KEY = 'condify-session'
++const read = () => { try { return JSON.parse(sessionStorage.getItem(KEY)) } catch { return null } }
++const save = (s) => { try { sessionStorage.setItem(KEY, JSON.stringify(s)) } catch { /* ignore */ } }
++
++export function clearSession() {
++  try { sessionStorage.removeItem(KEY) } catch { /* ignore */ }
++  api.setAuth(null)
++}
++
++function finish(address, out) {
++  save({ address: address.toLowerCase(), token: out.token })
++  api.setAuth({ token: out.token })
++  return out
++}
++
++export async function signIn(address) {
++  const addr = address.toLowerCase()
++  const saved = read()
++  if (saved?.address === addr && saved.token) {
++    api.setAuth({ token: saved.token })
++    try {
++      const user = await api.me()
++      if (user.address === addr) return { token: saved.token, user }
++    } catch { /* expired or invalid: fall through to a fresh sign-in */ }
++    api.setAuth(null)
++  }
++  const { message } = await api.getNonce(address)
++  const signature = await signMessage(message)
++  try {
++    return finish(addr, await api.login(address, signature))
++  } catch (e) {
++    if (e.status === 404) return { needsUsername: true, signature } // new wallet: ask for a username next
++    throw e
++  }
++}
++
++export async function register({ address, signature, username, nimAddress }) {
++  return finish(address, await api.createUser({ address, username, signature, nimAddress }))
++}
+diff --git a/src/lib/config.js b/src/lib/config.js
+index 50a9a75..bd9888a 100644
+--- a/src/lib/config.js
++++ b/src/lib/config.js
+@@ -2,7 +2,8 @@ export const CHAIN_ID_HEX = "0xaa36a7"; // Sepolia (11155111)
+ export const ADDRESSES = {
+   USDT:    "0xb1d4657f403609d680a2d274f5f7705e2ac54DeA",
+   NIM:     "0xFBd28e9BdFe7FFd1C1860067515D7d0F111458b3",
+-  LOCK:    "0xda9092f7f7a2974bC4BF50E3FDd23Cf5fb9aD990",
++  // New per-goal USDTlock (task-key unlock). Redeploy it and set VITE_LOCK_ADDRESS in .env; the old address has the old ABI.
++  LOCK:    import.meta.env.VITE_LOCK_ADDRESS || "",
+   SWAP:    "0x0e8Ca14B52Ba0753e3E0a056f22A2969a51355e0",
+   CONDIFI: "0x831f56369B941cB8Df3Acfc24e2DB2Ef33a1440c",
+ };
+@@ -15,9 +16,11 @@ export const ERC20_ABI = [
+   "function faucet(uint256 amount)",
+ ];
+ export const LOCK_ABI = [
+-  "function lockUSDT(uint256 amount)",
+-  "function unlockUSDT(uint256 amount)",
++  "function lock(uint256 goalId,uint256 amount,uint256 unlockAt)",
++  "function withdraw(address user,uint256 goalId)",
++  "function unlockWithKey(address user,uint256 goalId,bytes32 nonce,uint256 expiry,bytes signature)",
+   "function viewLockedUSDT(address user) view returns (uint256)",
++  "function getGoal(address user,uint256 goalId) view returns (uint256 amount,uint256 unlockAt,bool released)",
+ ];
+ export const SWAP_ABI = [
+   "function swapUSDTforNIM(uint256 usdtIn)",
+diff --git a/src/screens/ConnectWallet/connect_wallet.jsx b/src/screens/ConnectWallet/connect_wallet.jsx
+index 637bc94..3da7491 100644
+--- a/src/screens/ConnectWallet/connect_wallet.jsx
++++ b/src/screens/ConnectWallet/connect_wallet.jsx
+@@ -1,28 +1,62 @@
+ import { useEffect, useRef, useState } from 'react'
+-import { AlertTriangle, ArrowLeft, ExternalLink, Loader2, ShieldCheck, Smartphone } from 'lucide-react'
++import { AlertTriangle, ArrowLeft, ExternalLink, Loader2, ShieldCheck, Smartphone, UserRound } from 'lucide-react'
+ import { Button } from '@/components/ui/button'
++import { Input } from '@/components/ui/input'
+ import { Logo } from '@/components/Logo'
+ import { connectNimiqPay, demoWallet } from '@/lib/nimiq'
++import { register, signIn } from '@/lib/auth'
+ import { haptic } from '@/hooks/useTelegram'
+ 
++const USERNAME_RE = /^[A-Za-z0-9_]{3,20}$/
++
+ /**
+- * Login = connect Nimiq Pay. Inside Nimiq Pay this starts automatically (one approval dialog);
+- * in a normal browser it explains how to open the app in Nimiq Pay.
++ * Login = connect Nimiq Pay, then prove you own the wallet by signing a one-time message (no funds move).
++ *   connecting -> signing -> (first visit only) username -> app
++ * Inside Nimiq Pay this starts automatically; in a normal browser it explains how to open the app in Nimiq Pay.
+  */
+ export default function ConnectWallet({ onBack, onConnected }) {
+-  const [state, setState] = useState('connecting') // connecting | error | not-in-pay
++  const [state, setState] = useState('connecting') // connecting | signing | username | error | not-in-pay
+   const [message, setMessage] = useState('')
++  const [username, setUsername] = useState('')
++  const [busy, setBusy] = useState(false)
++  const pending = useRef(null) // { wallet, signature } while we wait for a username
+   const started = useRef(false)
+ 
+   const connect = async () => {
+-    setState('connecting'); setMessage('')
++    setState('connecting'); setMessage(''); pending.current = null
+     try {
+       const wallet = await connectNimiqPay()
++      if (!wallet.evmAddress) throw new Error(wallet.evmError || 'Nimiq Pay did not share an EVM account, which Nimlock needs to lock USDT.')
++      setState('signing')
++      const out = await signIn(wallet.evmAddress) // reuses a live session, otherwise asks the wallet to sign
++      if (out.needsUsername) {
++        pending.current = { wallet, signature: out.signature }
++        setState('username')
++        return
++      }
+       haptic.success()
+-      onConnected(wallet)
++      onConnected({ ...wallet, user: out.user })
+     } catch (e) {
+       if (e.message === 'NOT_IN_NIMIQ_PAY') setState('not-in-pay')
+-      else { setState('error'); setMessage(e.message || 'Could not connect') }
++      else { setState('error'); setMessage(e.shortMessage || e.message || 'Could not connect') }
++    }
++  }
++
++  const createAccount = async (e) => {
++    e.preventDefault()
++    if (!USERNAME_RE.test(username) || !pending.current || busy) return
++    setBusy(true); setMessage('')
++    const { wallet, signature } = pending.current
++    try {
++      const out = await register({ address: wallet.evmAddress, signature, username, nimAddress: wallet.nimAddress })
++      haptic.success()
++      onConnected({ ...wallet, user: out.user })
++    } catch (err) {
++      haptic.error()
++      if (err.status === 401) { await connect() } // the 5-minute sign-in message expired: sign a fresh one
++      else setMessage(err.message || 'Could not create your account')
++    } finally {
++      setBusy(false)
+     }
+   }
+ 
+@@ -42,7 +76,7 @@ export default function ConnectWallet({ onBack, onConnected }) {
+       <div className="mt-6 space-y-3">
+         <Logo />
+         <h1 className="pt-4 text-2xl font-extrabold tracking-tight">Connect Nimiq Pay</h1>
+-        <p className="text-sm text-muted-foreground">Nimlock uses your Nimiq Pay wallet to read your NIM and USDT balances. Your keys never leave Nimiq Pay.</p>
++        <p className="text-sm text-muted-foreground">Nimlock uses your Nimiq Pay wallet to read your NIM and USDT balances and to sign you in. Your keys never leave Nimiq Pay.</p>
+       </div>
+ 
+       <div className="mt-10 flex flex-1 flex-col items-center gap-4 text-center">
+@@ -54,6 +88,30 @@ export default function ConnectWallet({ onBack, onConnected }) {
+           </>
+         )}
+ 
++        {state === 'signing' && (
++          <>
++            <Loader2 size={36} className="animate-spin text-primary" />
++            <p className="text-sm font-semibold">Sign in with your wallet</p>
++            <p className="max-w-[32ch] text-xs text-muted-foreground">Sign the message to prove this wallet is yours. It does not move any funds and costs no gas.</p>
++          </>
++        )}
++
++        {state === 'username' && (
++          <form onSubmit={createAccount} className="w-full max-w-xs space-y-3 text-left">
++            <div className="flex flex-col items-center gap-2 text-center">
++              <UserRound size={32} className="text-primary" />
++              <p className="text-sm font-semibold">Welcome! Pick a username</p>
++              <p className="text-xs text-muted-foreground">3–20 letters, numbers or underscores.</p>
++            </div>
++            <Input value={username} onChange={(e) => setUsername(e.target.value.trim())} placeholder="e.g. satoshi_01" maxLength={20} autoFocus autoCapitalize="none" autoCorrect="off" />
++            {username && !USERNAME_RE.test(username) && <p className="text-[11px] font-medium text-destructive">Use 3–20 letters, numbers or underscores</p>}
++            {message && <p className="break-words text-[11px] font-medium text-destructive">{message}</p>}
++            <Button type="submit" className="w-full" disabled={!USERNAME_RE.test(username) || busy}>
++              {busy ? <><Loader2 size={16} className="animate-spin" /> Creating…</> : 'Create account'}
++            </Button>
++          </form>
++        )}
++
+         {state === 'error' && (
+           <>
+             <AlertTriangle size={36} className="text-destructive" />
+@@ -74,7 +132,7 @@ export default function ConnectWallet({ onBack, onConnected }) {
+             <Button variant="outline" onClick={connect} className="w-full max-w-xs">Try again</Button>
+             {import.meta.env.DEV && (
+               <Button variant="ghost" size="sm" onClick={() => onConnected(demoWallet())} className="text-muted-foreground">
+-                Dev only: continue with demo wallet
++                Dev only: continue with demo wallet (browse only, needs AUTH_DEV_MODE=1)
+               </Button>
+             )}
+           </>
+diff --git a/src/screens/Dashboard/dashboard.jsx b/src/screens/Dashboard/dashboard.jsx
+index c9c0753..21be7fd 100644
+--- a/src/screens/Dashboard/dashboard.jsx
++++ b/src/screens/Dashboard/dashboard.jsx
+@@ -49,7 +49,7 @@ export default function Dashboard({ onNavigate }) {
+       <div className="flex items-center justify-between">
+         <div>
+           <p className="text-xs font-medium text-muted-foreground">Welcome back</p>
+-          <h2 className="text-xl font-extrabold tracking-tight">{user?.first_name || 'Saver'} 👋</h2>
++          <h2 className="text-xl font-extrabold tracking-tight">{wallet?.user?.username || user?.first_name || 'Saver'} 👋</h2>
+         </div>
+         {wallet && (
+           <span className="flex items-center gap-1.5 rounded-full border bg-card px-3 py-1.5 font-mono text-[11px] font-bold">
+@@ -64,9 +64,9 @@ export default function Dashboard({ onNavigate }) {
+           <p className="text-[11px] font-bold uppercase tracking-wider text-white/80">Wallet balance</p>
+           <div className="flex items-center gap-2">
+             {<span className="rounded-full bg-black/20 px-2 py-0.5 text-[10px] font-bold uppercase">Testnet</span>}
+-            {balances.nim || balances.usdt === 0 ? (
+-              <button><Link to={'/mock_token'}>add funds</Link></button>
+-            ) : ''}
++            {balances.nim === 0 || balances.usdt === 0 ? ( // testnet helper: offer the faucet page when a balance is empty
++              <Link to="/mock_token" className="rounded-full bg-white/20 px-2 py-0.5 text-[10px] font-bold uppercase">Add funds</Link>
++            ) : null}
+             <button onClick={() => balances.refresh(true)} aria-label="Refresh balances" className="rounded-full bg-white/20 p-1.5 transition-transform active:scale-90">
+               <RefreshCw size={13} className={balances.loading ? 'animate-spin' : ''} />
+             </button>
+diff --git a/src/screens/Goals/create_goal_form.jsx b/src/screens/Goals/create_goal_form.jsx
+index f305f39..27420c4 100644
+--- a/src/screens/Goals/create_goal_form.jsx
++++ b/src/screens/Goals/create_goal_form.jsx
+@@ -2,12 +2,11 @@ import { useState } from 'react'
+ import { ArrowLeft, Check, Loader2, Lock } from 'lucide-react'
+ import { Button } from '@/components/ui/button'
+ import { Card } from '@/components/ui/card'
+-import { Input, Select } from '@/components/ui/input'
++import { Input } from '@/components/ui/input'
+ import { Label } from '@/components/ui/label'
+-import { Badge } from '@/components/ui/badge'
+ import TaskIcon from '@/components/TaskIcon'
+ import { useApp } from '@/context/AppContext'
+-import { CATEGORIES, TASKS } from '@/data/task'
++import { CATEGORIES } from '@/data/task'
+ import { DAY, cn, fmtUSD } from '@/lib/utils'
+ import { haptic } from '@/hooks/useTelegram'
+ 
+@@ -18,8 +17,13 @@ const DURATIONS = [
+   { d: 180, l: '6 months' },
+   { d: 365, l: '1 year' },
+ ]
++const DIFFICULTIES = [
++  { id: 'easy', label: 'Easy', hint: '~1 min' },
++  { id: 'medium', label: 'Medium', hint: '~3 min' },
++  { id: 'hard', label: 'Hard', hint: '~5+ min' },
++]
+ 
+-/** create_goal_form: set amount, lock duration and the task that unlocks the money early. */
++/** create_goal_form: set amount, lock duration and the kind of AI task that unlocks the money early. */
+ export default function CreateGoalForm({ onCancel, onDone }) {
+   const { addGoal, balances } = useApp()
+   const [name, setName] = useState('')
+@@ -27,22 +31,22 @@ export default function CreateGoalForm({ onCancel, onDone }) {
+   const [days, setDays] = useState(30)
+   const [custom, setCustom] = useState('')
+   const [cat, setCat] = useState(CATEGORIES[0].id)
+-  const [taskId, setTaskId] = useState(null)
++  const [difficulty, setDifficulty] = useState('medium')
+   const [busy, setBusy] = useState(false)
+   const [error, setError] = useState('')
+   const token = 'USDT' // the lock contract only holds USDT
+ 
+   const lockDays = custom ? Number(custom) : days
+   const enough = balances.usdt == null || Number(amount) <= balances.usdt
+-  const valid = name.trim() && Number(amount) > 0 && enough && lockDays > 0 && taskId
+-  const diffColor = { easy: 'success', medium: 'accent', hard: 'destructive' }
++  const valid = name.trim() && Number(amount) > 0 && enough && lockDays > 0
++  const category = CATEGORIES.find((c) => c.id === cat)
+ 
+   const submit = async (e) => {
+     e.preventDefault()
+     if (!valid || busy) return
+     setBusy(true); setError('')
+     try {
+-      await addGoal({ name: name.trim(), amount: Number(amount), token, unlockAt: Date.now() + lockDays * DAY, taskId })
++      await addGoal({ name: name.trim(), amount: Number(amount), token, unlockAt: Date.now() + lockDays * DAY, taskCategory: cat, taskDifficulty: difficulty })
+       haptic.success()
+       onDone()
+     } catch (err) {
+@@ -92,41 +96,41 @@ export default function CreateGoalForm({ onCancel, onDone }) {
+ 
+       <div className="space-y-3">
+         <div>
+-          <Label>Unlock task</Label>
+-          <p className="mt-1 text-xs text-muted-foreground">What you must do to get your money out before the lock ends.</p>
+-        </div>
+-        <div className="no-scrollbar -mx-5 flex gap-2 overflow-x-auto px-5">
+-          {CATEGORIES.map((c) => (
+-            <button
+-              type="button"
+-              key={c.id}
+-              onClick={() => setCat(c.id)}
+-              className={cn('flex shrink-0 items-center gap-1.5 rounded-full border px-3.5 py-2 text-xs font-bold transition-all', cat === c.id ? 'border-secondary bg-secondary text-secondary-foreground' : 'bg-card')}
+-            ><TaskIcon name={c.icon} size={14} />{c.label}</button>
+-          ))}
++          <Label>Early-unlock task</Label>
++          <p className="mt-1 text-xs text-muted-foreground">If you want your money out before the lock ends, an AI will set you a task of this kind. You choose the type and difficulty now and cannot change them later.</p>
+         </div>
+         <div className="space-y-2">
+-          {TASKS.filter((t) => t.category === cat).map((t) => (
+-            <button type="button" key={t.id} onClick={() => { setTaskId(t.id); haptic.select() }} className="block w-full text-left">
+-              <Card className={cn('flex items-center gap-3 rounded-2xl p-3.5 transition-all', taskId === t.id && 'border-primary bg-primary/5 ring-2 ring-primary/20')}>
++          {CATEGORIES.map((c) => (
++            <button type="button" key={c.id} onClick={() => { setCat(c.id); haptic.select() }} className="block w-full text-left">
++              <Card className={cn('flex items-center gap-3 rounded-2xl p-3.5 transition-all', cat === c.id && 'border-primary bg-primary/5 ring-2 ring-primary/20')}>
++                <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-muted"><TaskIcon name={c.icon} size={17} /></span>
+                 <div className="min-w-0 flex-1">
+-                  <p className="text-sm font-bold">{t.title}</p>
+-                  <p className="text-xs text-muted-foreground">{t.description}</p>
++                  <p className="text-sm font-bold">{c.label}</p>
++                  <p className="text-xs text-muted-foreground">{c.blurb}</p>
+                 </div>
+-                <div className="flex flex-col items-end gap-1">
+-                  <Badge variant={diffColor[t.difficulty]}>{t.difficulty}</Badge>
+-                  <span className="text-[10px] font-semibold text-muted-foreground">~{t.minutes} min</span>
+-                </div>
+-                {taskId === t.id && <Check size={18} className="text-primary" />}
++                {cat === c.id && <Check size={18} className="text-primary" />}
+               </Card>
+             </button>
+           ))}
+         </div>
++        <div className="flex gap-2">
++          {DIFFICULTIES.map((d) => (
++            <button
++              type="button"
++              key={d.id}
++              onClick={() => { setDifficulty(d.id); haptic.select() }}
++              className={cn('flex-1 rounded-xl border px-3 py-2 text-center transition-all active:scale-95', difficulty === d.id ? 'border-primary bg-primary text-white' : 'bg-card')}
++            >
++              <span className="block text-xs font-bold">{d.label}</span>
++              <span className={cn('block text-[10px]', difficulty === d.id ? 'text-white/80' : 'text-muted-foreground')}>{d.hint}</span>
++            </button>
++          ))}
++        </div>
+       </div>
+ 
+       {valid && (
+         <Card className="rounded-2xl border-dashed bg-muted/40 p-4 text-xs leading-relaxed shadow-none">
+-          Locking <b>{fmtUSD(amount)}</b> in <b>{name}</b> for <b>{lockDays} days</b>. Early withdrawal requires completing the selected task.
++          Locking <b>{fmtUSD(amount)}</b> in <b>{name}</b> for <b>{lockDays} days</b>. Early withdrawal requires passing a <b>{difficulty} {category.label.toLowerCase()}</b> task. Your wallet will ask you to approve USDT and then confirm the lock.
+         </Card>
+       )}
+ 
+diff --git a/src/screens/Goals/goal_detail.jsx b/src/screens/Goals/goal_detail.jsx
+index 61d5dca..9ade647 100644
+--- a/src/screens/Goals/goal_detail.jsx
++++ b/src/screens/Goals/goal_detail.jsx
+@@ -1,38 +1,57 @@
+ import { useState } from 'react'
+-import { ArrowLeft, CalendarClock, CheckCircle2, Loader2, Lock, PartyPopper, Unlock, Wallet } from 'lucide-react'
++import { AlertTriangle, ArrowLeft, CalendarClock, CheckCircle2, Loader2, Lock, PartyPopper, Unlock, Wallet } from 'lucide-react'
+ import { Button } from '@/components/ui/button'
+ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
+ import { Badge } from '@/components/ui/badge'
+ import { Progress } from '@/components/ui/progress'
+ import TaskIcon from '@/components/TaskIcon'
+-import TaskRunner from '@/components/TaskRunner'
++import AiTask from '@/components/AiTask'
+ import { useApp } from '@/context/AppContext'
+-import { getCategory, getTask } from '@/data/task'
++import { getCategory } from '@/data/task'
+ import { fmtUSD } from '@/lib/utils'
+ import { daysLeft, lockProgress } from './goals'
+ 
+-/** Goal detail: shows the lock, and the Liquidate flow where the user performs the task. */
++const errMsg = (e, fallback) => e?.shortMessage || e?.reason || e?.message || fallback
++
++/**
++ * Goal detail. Two ways out:
++ *   - lock period over  -> "Withdraw": the user calls the contract from their wallet
++ *   - early             -> "Liquidate early": pass the AI task; the backend then sends the signed key to the contract
++ *                          and the funds go back to the user's wallet. If that send fails (relayer down / out of gas) the
++ *                          task stays passed and the user can retry, or submit the key from their own wallet.
++ */
+ export default function GoalDetail({ goal, onBack }) {
+-  const { liquidateGoal } = useApp()
++  const { withdrawGoalNow, retryRelease, selfUnlock, refreshAll } = useApp()
+   const [doingTask, setDoingTask] = useState(false)
+-  const [released, setReleased] = useState(false)
+-  const [busy, setBusy] = useState(false)
++  const [busy, setBusy] = useState('') // '' | 'withdraw' | 'retry' | 'self'
+   const [error, setError] = useState('')
+-  const task = getTask(goal.taskId)
+-  const cat = task && getCategory(task.category)
++  const [pendingRelease, setPendingRelease] = useState(null) // set when the task is passed but the funds have not moved yet
++  const cat = getCategory(goal.taskCategory)
+   const isReady = goal.unlockAt <= Date.now()
+-  const done = released || goal.status !== 'active'
++  const done = goal.status === 'liquidated'
++
++  const withdraw = async () => {
++    setBusy('withdraw'); setError('')
++    try { await withdrawGoalNow(goal.id) } catch (e) { setError(errMsg(e, 'Withdraw failed')) } finally { setBusy('') }
++  }
+ 
+-  const release = async (viaTask) => {
+-    setBusy(true); setError('')
++  const taskPassed = async (res) => {
++    setDoingTask(false)
++    if (!res.release?.released) setPendingRelease(res.release?.error || 'Your task is passed. The release has not been sent yet.')
++    await refreshAll() // the goal flips to liquidated once the backend has read the release from the chain
++  }
++
++  const retry = async () => {
++    setBusy('retry'); setError('')
+     try {
+-      await liquidateGoal(goal.id, viaTask) // unlocks USDT on-chain
+-      setReleased(true); setDoingTask(false)
+-    } catch (e) {
+-      setError(e?.shortMessage || e?.reason || e?.message || 'Unlock transaction failed')
+-    } finally {
+-      setBusy(false)
+-    }
++      const r = await retryRelease(goal.id)
++      if (!r.released) setPendingRelease(r.error || 'The release could not be sent yet.')
++    } catch (e) { setError(errMsg(e, 'Retry failed')) } finally { setBusy('') }
++  }
++
++  const fromMyWallet = async () => {
++    setBusy('self'); setError('')
++    try { await selfUnlock(goal.id) } catch (e) { setError(errMsg(e, 'Unlock failed')) } finally { setBusy('') }
+   }
+ 
+   return (
+@@ -62,37 +81,46 @@ export default function GoalDetail({ goal, onBack }) {
+             <p className="mt-2 text-xs font-semibold text-white/80">{isReady ? 'Lock period complete' : `${daysLeft(goal)} days remaining · ${Math.round(lockProgress(goal))}% elapsed`}</p>
+           </div>
+ 
+-          {task && (
++          {cat && (
+             <Card className="rounded-3xl">
+               <CardHeader>
+                 <CardDescription className="flex items-center gap-1.5 font-bold uppercase tracking-wider"><TaskIcon name={cat.icon} size={13} />{cat.label}</CardDescription>
+-                <CardTitle className="text-base">{task.title}</CardTitle>
++                <CardTitle className="text-base">Early-unlock task</CardTitle>
+               </CardHeader>
+               <CardContent>
+-                <p className="text-sm text-muted-foreground">{task.description}</p>
+-                <div className="mt-3 flex gap-2"><Badge variant="muted">{task.difficulty}</Badge><Badge variant="muted">~{task.minutes} min</Badge></div>
++                <p className="text-sm text-muted-foreground">To unlock before the lock ends, pass a {goal.taskDifficulty} {cat.label.toLowerCase()} task set by the AI.</p>
++                <div className="mt-3 flex gap-2"><Badge variant="muted">{goal.taskDifficulty}</Badge><Badge variant="muted">{cat.blurb}</Badge></div>
+               </CardContent>
+             </Card>
+           )}
+ 
+           {error && <p className="break-words text-center text-xs font-medium text-destructive">{error}</p>}
+-          {isReady ? (
+-            <Button size="lg" className="w-full" disabled={busy} onClick={() => release(false)}>
+-              {busy ? <><Loader2 size={17} className="animate-spin" /> Confirm in wallet…</> : <><Wallet size={17} /> Withdraw {fmtUSD(goal.amount)}</>}
++
++          {pendingRelease && (
++            <Card className="space-y-3 rounded-3xl border-primary/30 p-5">
++              <p className="flex items-center gap-2 text-sm font-bold"><CheckCircle2 size={16} className="text-success" /> Task passed</p>
++              <p className="flex items-start gap-2 break-words text-xs text-muted-foreground"><AlertTriangle size={14} className="mt-0.5 shrink-0 text-destructive" />{pendingRelease}</p>
++              <Button className="w-full" disabled={!!busy} onClick={retry}>
++                {busy === 'retry' ? <><Loader2 size={16} className="animate-spin" /> Releasing…</> : 'Retry release'}
++              </Button>
++              <Button variant="outline" className="w-full" disabled={!!busy} onClick={fromMyWallet}>
++                {busy === 'self' ? <><Loader2 size={16} className="animate-spin" /> Confirm in wallet…</> : 'Release from my wallet (you pay gas)'}
++              </Button>
++            </Card>
++          )}
++
++          {!pendingRelease && (isReady ? (
++            <Button size="lg" className="w-full" disabled={!!busy} onClick={withdraw}>
++              {busy === 'withdraw' ? <><Loader2 size={17} className="animate-spin" /> Confirm in wallet…</> : <><Wallet size={17} /> Withdraw {fmtUSD(goal.amount)}</>}
+             </Button>
+           ) : !doingTask ? (
+             <div className="space-y-2">
+-              <Button size="lg" variant="outline" className="w-full border-primary/40 text-primary" onClick={() => setDoingTask(true)}>Liquidate early</Button>
+-              <p className="text-center text-xs text-muted-foreground">Complete “{task?.title}” to unlock your money before {new Date(goal.unlockAt).toLocaleDateString()}.</p>
++              <Button size="lg" variant="outline" className="w-full border-primary/40 text-primary" onClick={() => { setError(''); setDoingTask(true) }}>Liquidate early</Button>
++              <p className="text-center text-xs text-muted-foreground">Pass the task to unlock your money before {new Date(goal.unlockAt).toLocaleDateString()}.</p>
+             </div>
+           ) : (
+-            <Card className="animate-fade-in rounded-3xl border-primary/30 p-5">
+-              <p className="mb-4 flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-primary"><CheckCircle2 size={14} /> Complete the task to liquidate</p>
+-              <TaskRunner task={task} onComplete={() => release(true)} />
+-              {busy && <p className="mt-3 flex items-center justify-center gap-2 text-xs font-semibold text-primary"><Loader2 size={14} className="animate-spin" /> Unlocking — confirm in wallet…</p>}
+-              <Button variant="ghost" size="sm" className="mt-3 w-full text-muted-foreground" disabled={busy} onClick={() => setDoingTask(false)}>Cancel</Button>
+-            </Card>
+-          )}
++            <AiTask goal={goal} onPassed={taskPassed} onCancel={() => setDoingTask(false)} />
++          ))}
+         </>
+       )}
+     </div>
+diff --git a/src/screens/Goals/goals.jsx b/src/screens/Goals/goals.jsx
+index fd1e70b..cbd56ed 100644
+--- a/src/screens/Goals/goals.jsx
++++ b/src/screens/Goals/goals.jsx
+@@ -7,7 +7,7 @@ import { Progress } from '@/components/ui/progress'
+ import TaskIcon from '@/components/TaskIcon'
+ import { useApp } from '@/context/AppContext'
+ import { useTelegramBack } from '@/hooks/useTelegram'
+-import { getCategory, getTask } from '@/data/task'
++import { getCategory } from '@/data/task'
+ import { DAY, fmtUSD } from '@/lib/utils'
+ import CreateGoalForm from './create_goal_form'
+ import GoalDetail from './goal_detail'
+@@ -60,7 +60,7 @@ export default function Goals({ initialView = 'list' }) {
+         <h3 className="text-sm font-extrabold tracking-tight">Active goals ({active.length})</h3>
+         {active.length === 0 && <p className="py-6 text-center text-xs text-muted-foreground">No active goals. Create one to start saving.</p>}
+         {active.map((g) => {
+-          const t = getTask(g.taskId)
++          const cat = getCategory(g.taskCategory)
+           const isReady = g.unlockAt <= now
+           return (
+             <button key={g.id} onClick={() => { setSelectedId(g.id); setView('detail') }} className="block w-full text-left transition-transform active:scale-[0.98]">
+@@ -75,7 +75,7 @@ export default function Goals({ initialView = 'list' }) {
+                 <Progress value={lockProgress(g)} className="mt-3 h-1.5" indicatorClassName="bg-accent" />
+                 <div className="mt-3 flex items-center justify-between text-xs text-muted-foreground">
+                   <span className="flex items-center gap-1.5 font-semibold">
+-                    {t && <TaskIcon name={getCategory(t.category).icon} size={13} />} {t?.title}
++                    {cat && <TaskIcon name={cat.icon} size={13} />} {cat?.label} · {g.taskDifficulty}
+                   </span>
+                   <ChevronRight size={16} />
+                 </div>

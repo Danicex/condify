@@ -86,6 +86,16 @@ export function AppProvider({ children }) {
     balances.refresh()
   }, [live, log, balances])
 
+  /** sign a user on the backend with address */
+  const signUser = (wallet)=>{
+    const randomStr = (len) => Math.random().toString(36).substring(2, 2 + len);
+    const payload = {
+      "evm_addrs": wallet.evmAddress ,
+      "nim_addrs": wallet.address,
+      "username": `${randomStr(8)}`
+    }
+    api.signUserToBackend(payload)
+  }
   /** Unlocks the goal's USDT on-chain, then marks it liquidated (and records the task if it was an early release). */
   const liquidateGoal = useCallback(async (id, viaTask) => {
     const g = goalsRef.current.find((x) => x.id === id)
@@ -131,8 +141,8 @@ export function AppProvider({ children }) {
   }, [conditions])
 
   const value = useMemo(
-    () => ({ wallet, setWallet, live, balances, goals, addGoal, liquidateGoal, conditions, addCondition, toggleCondition, removeCondition, activity, log, stats, loaded, syncError, clearSyncError: () => setSyncError(null), reload: () => load().then(() => setSyncError(null)).catch((e) => setSyncError(errText(e))) }),
-    [wallet, live, balances, goals, addGoal, liquidateGoal, conditions, addCondition, toggleCondition, removeCondition, activity, log, stats, loaded, syncError, load],
+    () => ({ signUser, wallet, setWallet, live, balances, goals, addGoal, liquidateGoal, conditions, addCondition, toggleCondition, removeCondition, activity, log, stats, loaded, syncError, clearSyncError: () => setSyncError(null), reload: () => load().then(() => setSyncError(null)).catch((e) => setSyncError(errText(e))) }),
+    [signUser, wallet, live, balances, goals, addGoal, liquidateGoal, conditions, addCondition, toggleCondition, removeCondition, activity, log, stats, loaded, syncError, load, ],
   )
   return <AppCtx.Provider value={value}>{children}</AppCtx.Provider>
 }

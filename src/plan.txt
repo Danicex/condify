@@ -35,3 +35,15 @@ these are the thigns that are unompleted and i dont understand the flow. the goa
 -who pays the gas, since the gas is paid in eth, nimiq currently only support usdt and nim, so how would the app pay the gas
 -the task verification system speaks directly to the contract right? 
 -where is the withdraw component if there is any and where does the funds go from here. 
+
+
+connect frontend to backend
+-auth, , conditions
+
+add fake funds
+test app
+
+edit contract to unlock funds based on task key
+
+backend:
+create task / verify task. 

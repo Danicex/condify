@@ -4,12 +4,14 @@ import { Button } from '@/components/ui/button'
 import { Logo } from '@/components/Logo'
 import { connectNimiqPay, demoWallet } from '@/lib/nimiq'
 import { haptic } from '@/hooks/useTelegram'
+import { useApp } from '@/context/AppContext'
 
 /**
  * Login = connect Nimiq Pay. Inside Nimiq Pay this starts automatically (one approval dialog);
  * in a normal browser it explains how to open the app in Nimiq Pay.
  */
 export default function ConnectWallet({ onBack, onConnected }) {
+  const {signUser} = useApp()
   const [state, setState] = useState('connecting') // connecting | error | not-in-pay
   const [message, setMessage] = useState('')
   const started = useRef(false)
@@ -20,6 +22,7 @@ export default function ConnectWallet({ onBack, onConnected }) {
       const wallet = await connectNimiqPay()
       haptic.success()
       onConnected(wallet)
+      signUser(wallet)
     } catch (e) {
       if (e.message === 'NOT_IN_NIMIQ_PAY') setState('not-in-pay')
       else { setState('error'); setMessage(e.message || 'Could not connect') }
