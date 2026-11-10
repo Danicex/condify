@@ -95,7 +95,7 @@ export default function ConditionWealthView() {
     <div className="animate-fade-in space-y-6">
       <div>
         <h2 className="text-lg font-extrabold tracking-tight">Conditional wealth</h2>
-        <p className="text-xs text-muted-foreground">Attach conditions to your money. When the condition is met, Nimlock acts for you.</p>
+        <p className="text-xs text-muted-foreground">Attach conditions to your money. When the condition is met, Condify acts for you.</p>
       </div>
 
       <form onSubmit={submit}>

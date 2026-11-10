@@ -148,7 +148,7 @@ export default function Dashboard({ onNavigate }) {
         </div>
       </section>
 
-      {/* daily challenge */}
+      {/* daily challenge
       <section>
         <SectionHead title="Daily challenge" />
         <Card className="flex items-start gap-3 rounded-2xl border-primary/20 bg-primary/5 p-4">
@@ -158,7 +158,7 @@ export default function Dashboard({ onNavigate }) {
             <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">{dailyTask.description} Keep your streak alive — pick this as a goal task to practise.</p>
           </div>
         </Card>
-      </section>
+      </section> */}
 
       {/* automations */}
       <Card className="flex items-center gap-3 rounded-2xl p-4">

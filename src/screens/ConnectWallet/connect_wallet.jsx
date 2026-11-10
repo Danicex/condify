@@ -26,7 +26,7 @@ export default function ConnectWallet({ onBack, onConnected }) {
     setState('connecting'); setMessage(''); pending.current = null
     try {
       const wallet = await connectNimiqPay()
-      if (!wallet.evmAddress) throw new Error(wallet.evmError || 'Nimiq Pay did not share an EVM account, which Nimlock needs to lock USDT.')
+      if (!wallet.evmAddress) throw new Error(wallet.evmError || 'Nimiq Pay did not share an EVM account, which Condify needs to lock USDT.')
       setState('signing')
       const out = await signIn(wallet.evmAddress) // reuses a live session, otherwise asks the wallet to sign
       if (out.needsUsername) {
@@ -76,7 +76,7 @@ export default function ConnectWallet({ onBack, onConnected }) {
       <div className="mt-6 space-y-3">
         <Logo />
         <h1 className="pt-4 text-2xl font-extrabold tracking-tight">Connect Nimiq Pay</h1>
-        <p className="text-sm text-muted-foreground">Nimlock uses your Nimiq Pay wallet to read your NIM and USDT balances and to sign you in. Your keys never leave Nimiq Pay.</p>
+        <p className="text-sm text-muted-foreground">Condify uses your Nimiq Pay wallet to read your NIM and USDT balances and to sign you in. Your keys never leave Nimiq Pay.</p>
       </div>
 
       <div className="mt-10 flex flex-1 flex-col items-center gap-4 text-center">
@@ -124,7 +124,7 @@ export default function ConnectWallet({ onBack, onConnected }) {
         {state === 'not-in-pay' && (
           <>
             <Smartphone size={36} className="text-primary" />
-            <p className="text-sm font-semibold">Open Nimlock inside Nimiq Pay</p>
+            <p className="text-sm font-semibold">Open Condify inside Nimiq Pay</p>
             <p className="max-w-[34ch] text-xs text-muted-foreground">
               This app talks to your wallet through Nimiq Pay. Open Nimiq Pay, go to <b>Mini Apps</b> and load this app.
             </p>
