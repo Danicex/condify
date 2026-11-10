@@ -9,7 +9,7 @@ import { useTelegram } from '@/hooks/useTelegram'
 import { useMarket } from '@/hooks/useMarket'
 import { TASKS, getCategory } from '@/data/task'
 import { DAY, fmtPrice, fmtUSD, shortAddr, cn } from '@/lib/utils'
-
+import { Link } from 'react-router-dom'
 const SYMBOLS = ['BTC', 'SOL', 'NIM']
 const ICONS = { lock: Lock, unlock: Unlock, swap: RefreshCw, send: Send, task: Brain, rule: Cpu }
 
@@ -64,6 +64,9 @@ export default function Dashboard({ onNavigate }) {
           <p className="text-[11px] font-bold uppercase tracking-wider text-white/80">Wallet balance</p>
           <div className="flex items-center gap-2">
             {<span className="rounded-full bg-black/20 px-2 py-0.5 text-[10px] font-bold uppercase">Testnet</span>}
+            {balances.nim || balances.usdt === 0 ? (
+              <button><Link to={'/mock_token'}>add funds</Link></button>
+            ) : ''}
             <button onClick={() => balances.refresh(true)} aria-label="Refresh balances" className="rounded-full bg-white/20 p-1.5 transition-transform active:scale-90">
               <RefreshCw size={13} className={balances.loading ? 'animate-spin' : ''} />
             </button>

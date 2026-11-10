@@ -19,3 +19,19 @@ give me a scope of what i am doing with the contract, correct me if i am wrong.
 - mocktoken contract create mock token, when deployed i can call the approve, balance of, allowance functions. i need to do this before deploying others. it holds the money i need to run the other contracts
 - after i ran deployed moctoken i was given an address is it this adress i will pass to usdtlock? and swap? 
 also i have to deploy usdtlock and swap to call the fucntions 
+
+
+
+
+
+
+everything here is to know how i will wire it for production. explain in details and be brief
+these are the thigns that are unompleted and i dont understand the flow. the goal is first to understand before i start building.
+
+-user sign in the app through nimiq connect. where do the app fetch the funds (nim, usdt) that is displayed on the dashboard from.
+-the backend signs the user: explain the whole process here
+-swap btw usdt and nim currently wont work becos nimiq isnt on same network with eth tokens. how do i create a bridge to make this posible
+-create task_ai explain the whole process to me and how will wire it with my frontend to display ui to complete task.
+-who pays the gas, since the gas is paid in eth, nimiq currently only support usdt and nim, so how would the app pay the gas
+-the task verification system speaks directly to the contract right? 
+-where is the withdraw component if there is any and where does the funds go from here. 

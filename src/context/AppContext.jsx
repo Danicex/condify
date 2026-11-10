@@ -27,6 +27,7 @@ const errText = (e) => e?.message || 'Request failed'
 export function AppProvider({ children }) {
   const [wallet, setWallet] = useState(null) // from connectNimiqPay()
   const balances = useBalances(wallet)
+
   const [goals, setGoals] = useState([])
   const [conditions, setConditions] = useState([])
   const [activity, setActivity] = useState([])

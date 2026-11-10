@@ -13,7 +13,8 @@ import ConditionWealthView from '@/screens/Goals/conditional_wealth'
 import SwapMatrixView from '@/screens/Swap'
 import SendView from '@/screens/Send'
 import SettingsView from '@/screens/SettingsScreen'
-
+import TokenTools from './test/mockToken'
+import { Routes, Route } from 'react-router-dom'
 /**
  * App flow:  landing → connect wallet (login) → home → [goals | swap | settings | conditional wealth]
  */
@@ -91,15 +92,27 @@ function Flow() {
 export default function App() {
   useTelegram() // ready(), expand(), safe-area insets, header colours
   return (
-    <ThemeProvider>
-      <AppProvider>
-        {/* Inside Telegram the app fills the whole webview; in a browser it sits in a phone frame on large screens */}
-        <div className={cn('flex min-h-dvh items-center justify-center bg-background', !isTelegram && 'sm:bg-muted sm:p-6')}>
-          <div className={cn('relative h-dvh w-full overflow-hidden bg-background text-foreground', !isTelegram && 'sm:h-[min(900px,calc(100dvh-3rem))] sm:max-w-[430px] sm:rounded-[40px] sm:border sm:shadow-2xl')}>
-            <Flow />
-          </div>
-        </div>
-      </AppProvider>
-    </ThemeProvider>
+ <ThemeProvider>
+  <AppProvider>
+    {/* Inside Telegram the app fills the whole webview; in a browser it sits in a phone frame on large screens */}
+    <div className={cn('flex min-h-dvh items-center justify-center bg-background', !isTelegram && 'sm:bg-muted sm:p-6')}>
+      <div className={cn('relative h-dvh w-full overflow-hidden bg-background text-foreground', !isTelegram && 'sm:h-[min(900px,calc(100dvh-3rem))] sm:max-w-[430px] sm:rounded-[40px] sm:border sm:shadow-2xl')}>
+        
+        {/* Routes handle what dynamically renders inside the phone frame */}
+        <Routes>
+          {/* Main App entry point */}
+          <Route path="/" element={<Flow />} />
+          
+          {/* Dev/Token tools page */}
+          <Route path="/mock_token" element={<TokenTools />} />
+          
+          {/* Fallback 404 page */}
+        </Routes>
+
+      </div>
+    </div>
+  </AppProvider>
+</ThemeProvider>
+
   )
 }

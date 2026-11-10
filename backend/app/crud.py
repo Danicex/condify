@@ -67,7 +67,7 @@ def read_data(obj_name: str, session: SessionDep, user_id: int, limit: int = 100
     ).all()
 
 
-def create_data(obj_name: str, data_obj, session: SessionDep, user_id: int):
+def create_data(obj_name: str, data_obj, session: SessionDep, user_id: Optional[int] = None):
     """
     Create a record owned by user_id. Returns (ok, instance).
     user_id is always set here, any user_id in the payload is ignored.
@@ -75,12 +75,13 @@ def create_data(obj_name: str, data_obj, session: SessionDep, user_id: int):
     model_class = obj_map.get(obj_name.lower())
     if not model_class:
         return False, None
-
-    values = _dump(data_obj)
-    values.pop("id", None)
-    values["user_id"] = user_id
-    if not _refs_ok(values, session, user_id):
-        return False, None
+    
+    if user_id:
+        values = _dump(data_obj)
+        values.pop("id", None)
+        values["user_id"] = user_id
+        if not _refs_ok(values, session, user_id):
+            return False, None
 
     instance = model_class(**values)
     session.add(instance)
