@@ -7,7 +7,7 @@ import { Progress } from '@/components/ui/progress'
 import TaskIcon from '@/components/TaskIcon'
 import { useApp } from '@/context/AppContext'
 import { useTelegramBack } from '@/hooks/useTelegram'
-import { getCategory, getTask } from '@/data/task'
+import { getCategory } from '@/data/task'
 import { DAY, fmtUSD } from '@/lib/utils'
 import CreateGoalForm from './create_goal_form'
 import GoalDetail from './goal_detail'
@@ -60,7 +60,7 @@ export default function Goals({ initialView = 'list' }) {
         <h3 className="text-sm font-extrabold tracking-tight">Active goals ({active.length})</h3>
         {active.length === 0 && <p className="py-6 text-center text-xs text-muted-foreground">No active goals. Create one to start saving.</p>}
         {active.map((g) => {
-          const t = getTask(g.taskId)
+          const cat = getCategory(g.taskCategory)
           const isReady = g.unlockAt <= now
           return (
             <button key={g.id} onClick={() => { setSelectedId(g.id); setView('detail') }} className="block w-full text-left transition-transform active:scale-[0.98]">
@@ -75,7 +75,7 @@ export default function Goals({ initialView = 'list' }) {
                 <Progress value={lockProgress(g)} className="mt-3 h-1.5" indicatorClassName="bg-accent" />
                 <div className="mt-3 flex items-center justify-between text-xs text-muted-foreground">
                   <span className="flex items-center gap-1.5 font-semibold">
-                    {t && <TaskIcon name={getCategory(t.category).icon} size={13} />} {t?.title}
+                    {cat && <TaskIcon name={cat.icon} size={13} />} {cat?.label} · {g.taskDifficulty}
                   </span>
                   <ChevronRight size={16} />
                 </div>

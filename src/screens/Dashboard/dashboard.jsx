@@ -49,7 +49,7 @@ export default function Dashboard({ onNavigate }) {
       <div className="flex items-center justify-between">
         <div>
           <p className="text-xs font-medium text-muted-foreground">Welcome back</p>
-          <h2 className="text-xl font-extrabold tracking-tight">{user?.first_name || 'Saver'} 👋</h2>
+          <h2 className="text-xl font-extrabold tracking-tight">{wallet?.user?.username || user?.first_name || 'Saver'} 👋</h2>
         </div>
         {wallet && (
           <span className="flex items-center gap-1.5 rounded-full border bg-card px-3 py-1.5 font-mono text-[11px] font-bold">
@@ -64,9 +64,9 @@ export default function Dashboard({ onNavigate }) {
           <p className="text-[11px] font-bold uppercase tracking-wider text-white/80">Wallet balance</p>
           <div className="flex items-center gap-2">
             {<span className="rounded-full bg-black/20 px-2 py-0.5 text-[10px] font-bold uppercase">Testnet</span>}
-            {balances.nim || balances.usdt === 0 ? (
-              <button><Link to={'/mock_token'}>add funds</Link></button>
-            ) : ''}
+            {balances.nim === 0 || balances.usdt === 0 ? ( // testnet helper: offer the faucet page when a balance is empty
+              <Link to="/mock_token" className="rounded-full bg-white/20 px-2 py-0.5 text-[10px] font-bold uppercase">Add funds</Link>
+            ) : null}
             <button onClick={() => balances.refresh(true)} aria-label="Refresh balances" className="rounded-full bg-white/20 p-1.5 transition-transform active:scale-90">
               <RefreshCw size={13} className={balances.loading ? 'animate-spin' : ''} />
             </button>

@@ -1,0 +1,10 @@
+{
+  "name": "nimlock-e2e",
+  "private": true,
+  "description": "Compiles the Solidity contracts so the Python end-to-end tests can deploy them on a local in-memory EVM.",
+  "scripts": { "compile": "node compile_contracts.js" },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.0.2",
+    "solc": "^0.8.20"
+  }
+}

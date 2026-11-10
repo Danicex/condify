@@ -11,3 +11,13 @@ node_modules/
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Local databases (dev data, never commit)
+*.db
+
+# keep the env templates, ignore real env files
+!.env.example
+
+# build output / e2e artifacts
+dist/
+backend/e2e/compiled.json

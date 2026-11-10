@@ -1,7 +1,11 @@
-fastapi
+fastapi>=0.110
 uvicorn[standard]
-sqlmodel
-httpx        # only for tests
+sqlmodel>=0.0.16
+python-multipart>=0.0.9   # file uploads for task proof (image / audio / video)
+PyJWT>=2.8                # login tokens
+openai>=1.40              # task generation + judging
+web3>=7                   # backend -> lock contract (reads goals, relays the unlock key)
 eth-utils
 eth-account
-eth-abi  
+eth-abi
+httpx                     # only for tests
