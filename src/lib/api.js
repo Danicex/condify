@@ -19,7 +19,9 @@ const detailText = (d, status) => {
 }
 
 async function request(method, path, body) {
-  const headers = {}
+  // ngrok's free tier answers browsers with a "Visit Site" warning page (no CORS headers, never reaches the backend,
+  // shows up as "Failed to fetch"). This header skips it. The backend ignores it.
+  const headers = { 'ngrok-skip-browser-warning': 'true' }
   if (auth.token) headers.Authorization = `Bearer ${auth.token}`
   else if (import.meta.env.DEV && auth.devAddress) headers['X-Dev-Address'] = auth.devAddress
 
@@ -28,7 +30,15 @@ async function request(method, path, body) {
   else if (body !== undefined) { headers['Content-Type'] = 'application/json'; payload = JSON.stringify(body) }
 
   const hadToken = !!auth.token
-  const res = await fetch(`${BASE}${path}`, { method, headers, body: payload })
+  let res
+  try {
+    res = await fetch(`${BASE}${path}`, { method, headers, body: payload })
+  } catch (e) {
+    // the browser only says "Failed to fetch" for DNS / TLS / CORS / blocked requests: name the URL so it can be debugged
+    const err = new Error(`Cannot reach the server at ${BASE}. Check VITE_API_URL, that the backend is running, and that CORS_ORIGINS includes ${window.location.origin}.`)
+    err.cause = e
+    throw err
+  }
   if (!res.ok) {
     let detail = ''
     try { detail = (await res.json()).detail } catch { /* not json */ }
