@@ -54,7 +54,7 @@ const goalIn = (g) => ({
 const activityIn = (a) => ({ id: a.id, kind: a.kind, text: a.text, txHash: a.tx_hash, at: ts(a.created_at) })
 const taskIn = (t) => ({ id: t.id, goalId: t.goal_id, category: t.category, at: ts(t.completed_at) })
 
-// ---- auth (wallet signature login) ----
+// ---- auth (wallet signature login) ----  
 export const getNonce = (address) => request('GET', `/auth/nonce?address=${encodeURIComponent(address)}`)
 export const login = (address, signature) => request('POST', '/auth/login', { address, signature })
 export const createUser = ({ address, username, signature, nimAddress }) =>

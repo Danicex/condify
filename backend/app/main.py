@@ -24,7 +24,7 @@ app = FastAPI(title="Nimlock API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("CORS_ORIGINS", "http://localhost:5173").split(","),  # comma-separated list
+    allow_origins=["*"],  # comma-separated list
     allow_methods=["*"],
     allow_headers=["*"],
 )

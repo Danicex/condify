@@ -5,7 +5,6 @@ Wallet-signature login (Sign-In-with-Ethereum style). No passwords: the user pro
   2. wallet signs it (personal_sign / ethers signer.signMessage(message))
   3. POST /auth/create_user  {address, username, signature}   first time: verifies the signature, creates the user, returns a JWT
      POST /auth/login        {address, signature}             returning user: verifies the signature, returns a JWT
-     (login answers 404 for an unknown wallet WITHOUT burning the nonce, so the same signature can be sent to create_user)
   4. every other route sends  Authorization: Bearer <jwt>   and depends on CurrentUser (get_current_user below)
 
 Env:
@@ -27,7 +26,7 @@ from pydantic import BaseModel, StringConstraints
 from sqlmodel import select
 
 from app.database import SessionDep
-from app.model import AuthNonce, User, UserRead, as_utc, utcnow
+from app.model import AuthNonce, User, UserRead, utcnow
 from app.wallet import normalize_address, verify_signed_message
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -112,9 +111,6 @@ class NonceOut(BaseModel):
 def get_nonce(session: SessionDep, address: str = Query(...)):
     addr = _norm(address)
     now = utcnow()
-    existing = session.get(AuthNonce, addr)
-    if existing and as_utc(existing.expires_at) > now + timedelta(seconds=30):  # still valid: hand out the same one
-        return NonceOut(address=addr, nonce=existing.nonce, message=existing.message, expires_at=as_utc(existing.expires_at).isoformat())
     nonce = secrets.token_hex(16)
     expires = now + NONCE_TTL
     message = (
@@ -122,8 +118,8 @@ def get_nonce(session: SessionDep, address: str = Query(...)):
         f"Address: {addr}\nNonce: {nonce}\nIssued At: {now.isoformat()}\nExpires At: {expires.isoformat()}\n\n"
         "This only proves you own the address. It does not move any funds."
     )
-    row = existing
-    if row:  # expired (or about to): replace it
+    row = session.get(AuthNonce, addr)
+    if row:  # one pending challenge per address: a new request replaces the old one
         row.nonce, row.message, row.expires_at = nonce, message, expires
     else:
         row = AuthNonce(address=addr, nonce=nonce, message=message, expires_at=expires)
@@ -135,7 +131,7 @@ def get_nonce(session: SessionDep, address: str = Query(...)):
 def _consume_challenge(session: SessionDep, address: str, signature: str) -> None:
     """Checks the signature against the stored challenge, then burns the nonce (single use). Raises 401 on any failure."""
     row = session.get(AuthNonce, address)
-    if not row or as_utc(row.expires_at) <= utcnow():
+    if not row or row.expires_at <= utcnow():
         raise HTTPException(401, "no valid challenge for this address, request a new nonce")
     if not verify_signed_message(address, row.message, signature):
         raise HTTPException(401, "invalid signature for this address")
@@ -145,14 +141,15 @@ def _consume_challenge(session: SessionDep, address: str, signature: str) -> Non
 
 # ───────────────────────────── create user / login ─────────────────────────────
 class CreateUser(BaseModel):
-    address: str  # wallet (EVM) address
+    evm_addrs: str  # wallet (EVM) address
+    nim_addrs: str 
     username: Username
     signature: Signature  # signature of the message from GET /auth/nonce
     nim_address: Optional[str] = None
 
 
 class Login(BaseModel):
-    address: str
+    addrs: str
     signature: Signature
 
 
@@ -163,7 +160,7 @@ class AuthOut(BaseModel):
 
 @router.post("/create_user", response_model=AuthOut, status_code=201)
 def create_user(payload: CreateUser, session: SessionDep):
-    addr = _norm(payload.address)
+    addr = _norm(payload.evm_addrs)
     if session.exec(select(User).where(User.address == addr)).first():
         raise HTTPException(409, "this wallet already has an account, use /auth/login")
     if session.exec(select(User).where(User.username == payload.username)).first():
@@ -181,7 +178,7 @@ def create_user(payload: CreateUser, session: SessionDep):
 
 @router.post("/login", response_model=AuthOut)
 def login(payload: Login, session: SessionDep):
-    addr = _norm(payload.address)
+    addr = _norm(payload.addrs)
     user = session.exec(select(User).where(User.address == addr)).first()
     if not user:
         raise HTTPException(404, "no account for this wallet, use /auth/create_user")
