@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { Cpu, LayoutDashboard, RefreshCw, Settings, Target } from 'lucide-react'
 import { ThemeProvider } from '@/hooks/useTheme'
 import { AppProvider, useApp } from '@/context/AppContext'
@@ -47,6 +47,11 @@ function Flow() {
     setPage('dashboard'); setStep('landing')
   }
   const navigate = useCallback((to, state) => { setGoalsView(state || 'list'); setPage(to) }, [])
+
+  // the session ended on its own (token expired / rejected by the backend): back to sign-in instead of a blank screen
+  useEffect(() => {
+    if (step === 'app' && !wallet) { setPage('dashboard'); setStep('connect') }
+  }, [step, wallet])
 
   if (step === 'landing') return <LaunchScreen onStart={() => setStep('connect')} />
   if (step === 'connect') return <ConnectWallet onBack={() => setStep('landing')} onConnected={connected} />

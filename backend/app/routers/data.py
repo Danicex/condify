@@ -5,9 +5,7 @@ from app.deps import CurrentUser
 from app.database import SessionDep
 from app.model import (
     ActivityCreate, ActivityRead, ActivityUpdate,
-    GoalCreate, GoalRead, GoalUpdate,
     RuleCreate, RuleRead, RuleUpdate,
-    TaskCreate, TaskRead, TaskUpdate,
 )
 
 
@@ -49,9 +47,9 @@ def make_router(obj_name: str, plural: str, Create, Update, Read) -> APIRouter:
     return router
 
 
+# Goals and tasks are NOT generic CRUD: they mirror on-chain state and AI grading, so they have their own routers
+# (routers/goals.py, routers/tasks.py) where the server, not the client, decides status, amounts and results.
 routers = [
-    make_router("goal", "goals", GoalCreate, GoalUpdate, GoalRead),
     make_router("rule", "rules", RuleCreate, RuleUpdate, RuleRead),
     make_router("activity", "activities", ActivityCreate, ActivityUpdate, ActivityRead),
-    make_router("task", "tasks", TaskCreate, TaskUpdate, TaskRead),
 ]

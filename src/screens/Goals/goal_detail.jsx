@@ -1,38 +1,57 @@
 import { useState } from 'react'
-import { ArrowLeft, CalendarClock, CheckCircle2, Loader2, Lock, PartyPopper, Unlock, Wallet } from 'lucide-react'
+import { AlertTriangle, ArrowLeft, CalendarClock, CheckCircle2, Loader2, Lock, PartyPopper, Unlock, Wallet } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Progress } from '@/components/ui/progress'
 import TaskIcon from '@/components/TaskIcon'
-import TaskRunner from '@/components/TaskRunner'
+import AiTask from '@/components/AiTask'
 import { useApp } from '@/context/AppContext'
-import { getCategory, getTask } from '@/data/task'
+import { getCategory } from '@/data/task'
 import { fmtUSD } from '@/lib/utils'
 import { daysLeft, lockProgress } from './goals'
 
-/** Goal detail: shows the lock, and the Liquidate flow where the user performs the task. */
-export default function GoalDetail({ goal, onBack }) {
-  const { liquidateGoal } = useApp()
-  const [doingTask, setDoingTask] = useState(false)
-  const [released, setReleased] = useState(false)
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState('')
-  const task = getTask(goal.taskId)
-  const cat = task && getCategory(task.category)
-  const isReady = goal.unlockAt <= Date.now()
-  const done = released || goal.status !== 'active'
+const errMsg = (e, fallback) => e?.shortMessage || e?.reason || e?.message || fallback
 
-  const release = async (viaTask) => {
-    setBusy(true); setError('')
+/**
+ * Goal detail. Two ways out:
+ *   - lock period over  -> "Withdraw": the user calls the contract from their wallet
+ *   - early             -> "Liquidate early": pass the AI task; the backend then sends the signed key to the contract
+ *                          and the funds go back to the user's wallet. If that send fails (relayer down / out of gas) the
+ *                          task stays passed and the user can retry, or submit the key from their own wallet.
+ */
+export default function GoalDetail({ goal, onBack }) {
+  const { withdrawGoalNow, retryRelease, selfUnlock, refreshAll } = useApp()
+  const [doingTask, setDoingTask] = useState(false)
+  const [busy, setBusy] = useState('') // '' | 'withdraw' | 'retry' | 'self'
+  const [error, setError] = useState('')
+  const [pendingRelease, setPendingRelease] = useState(null) // set when the task is passed but the funds have not moved yet
+  const cat = getCategory(goal.taskCategory)
+  const isReady = goal.unlockAt <= Date.now()
+  const done = goal.status === 'liquidated'
+
+  const withdraw = async () => {
+    setBusy('withdraw'); setError('')
+    try { await withdrawGoalNow(goal.id) } catch (e) { setError(errMsg(e, 'Withdraw failed')) } finally { setBusy('') }
+  }
+
+  const taskPassed = async (res) => {
+    setDoingTask(false)
+    if (!res.release?.released) setPendingRelease(res.release?.error || 'Your task is passed. The release has not been sent yet.')
+    await refreshAll() // the goal flips to liquidated once the backend has read the release from the chain
+  }
+
+  const retry = async () => {
+    setBusy('retry'); setError('')
     try {
-      await liquidateGoal(goal.id, viaTask) // unlocks USDT on-chain
-      setReleased(true); setDoingTask(false)
-    } catch (e) {
-      setError(e?.shortMessage || e?.reason || e?.message || 'Unlock transaction failed')
-    } finally {
-      setBusy(false)
-    }
+      const r = await retryRelease(goal.id)
+      if (!r.released) setPendingRelease(r.error || 'The release could not be sent yet.')
+    } catch (e) { setError(errMsg(e, 'Retry failed')) } finally { setBusy('') }
+  }
+
+  const fromMyWallet = async () => {
+    setBusy('self'); setError('')
+    try { await selfUnlock(goal.id) } catch (e) { setError(errMsg(e, 'Unlock failed')) } finally { setBusy('') }
   }
 
   return (
@@ -62,37 +81,46 @@ export default function GoalDetail({ goal, onBack }) {
             <p className="mt-2 text-xs font-semibold text-white/80">{isReady ? 'Lock period complete' : `${daysLeft(goal)} days remaining · ${Math.round(lockProgress(goal))}% elapsed`}</p>
           </div>
 
-          {task && (
+          {cat && (
             <Card className="rounded-3xl">
               <CardHeader>
                 <CardDescription className="flex items-center gap-1.5 font-bold uppercase tracking-wider"><TaskIcon name={cat.icon} size={13} />{cat.label}</CardDescription>
-                <CardTitle className="text-base">{task.title}</CardTitle>
+                <CardTitle className="text-base">Early-unlock task</CardTitle>
               </CardHeader>
               <CardContent>
-                <p className="text-sm text-muted-foreground">{task.description}</p>
-                <div className="mt-3 flex gap-2"><Badge variant="muted">{task.difficulty}</Badge><Badge variant="muted">~{task.minutes} min</Badge></div>
+                <p className="text-sm text-muted-foreground">To unlock before the lock ends, pass a {goal.taskDifficulty} {cat.label.toLowerCase()} task set by the AI.</p>
+                <div className="mt-3 flex gap-2"><Badge variant="muted">{goal.taskDifficulty}</Badge><Badge variant="muted">{cat.blurb}</Badge></div>
               </CardContent>
             </Card>
           )}
 
           {error && <p className="break-words text-center text-xs font-medium text-destructive">{error}</p>}
-          {isReady ? (
-            <Button size="lg" className="w-full" disabled={busy} onClick={() => release(false)}>
-              {busy ? <><Loader2 size={17} className="animate-spin" /> Confirm in wallet…</> : <><Wallet size={17} /> Withdraw {fmtUSD(goal.amount)}</>}
+
+          {pendingRelease && (
+            <Card className="space-y-3 rounded-3xl border-primary/30 p-5">
+              <p className="flex items-center gap-2 text-sm font-bold"><CheckCircle2 size={16} className="text-success" /> Task passed</p>
+              <p className="flex items-start gap-2 break-words text-xs text-muted-foreground"><AlertTriangle size={14} className="mt-0.5 shrink-0 text-destructive" />{pendingRelease}</p>
+              <Button className="w-full" disabled={!!busy} onClick={retry}>
+                {busy === 'retry' ? <><Loader2 size={16} className="animate-spin" /> Releasing…</> : 'Retry release'}
+              </Button>
+              <Button variant="outline" className="w-full" disabled={!!busy} onClick={fromMyWallet}>
+                {busy === 'self' ? <><Loader2 size={16} className="animate-spin" /> Confirm in wallet…</> : 'Release from my wallet (you pay gas)'}
+              </Button>
+            </Card>
+          )}
+
+          {!pendingRelease && (isReady ? (
+            <Button size="lg" className="w-full" disabled={!!busy} onClick={withdraw}>
+              {busy === 'withdraw' ? <><Loader2 size={17} className="animate-spin" /> Confirm in wallet…</> : <><Wallet size={17} /> Withdraw {fmtUSD(goal.amount)}</>}
             </Button>
           ) : !doingTask ? (
             <div className="space-y-2">
-              <Button size="lg" variant="outline" className="w-full border-primary/40 text-primary" onClick={() => setDoingTask(true)}>Liquidate early</Button>
-              <p className="text-center text-xs text-muted-foreground">Complete “{task?.title}” to unlock your money before {new Date(goal.unlockAt).toLocaleDateString()}.</p>
+              <Button size="lg" variant="outline" className="w-full border-primary/40 text-primary" onClick={() => { setError(''); setDoingTask(true) }}>Liquidate early</Button>
+              <p className="text-center text-xs text-muted-foreground">Pass the task to unlock your money before {new Date(goal.unlockAt).toLocaleDateString()}.</p>
             </div>
           ) : (
-            <Card className="animate-fade-in rounded-3xl border-primary/30 p-5">
-              <p className="mb-4 flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-primary"><CheckCircle2 size={14} /> Complete the task to liquidate</p>
-              <TaskRunner task={task} onComplete={() => release(true)} />
-              {busy && <p className="mt-3 flex items-center justify-center gap-2 text-xs font-semibold text-primary"><Loader2 size={14} className="animate-spin" /> Unlocking — confirm in wallet…</p>}
-              <Button variant="ghost" size="sm" className="mt-3 w-full text-muted-foreground" disabled={busy} onClick={() => setDoingTask(false)}>Cancel</Button>
-            </Card>
-          )}
+            <AiTask goal={goal} onPassed={taskPassed} onCancel={() => setDoingTask(false)} />
+          ))}
         </>
       )}
     </div>

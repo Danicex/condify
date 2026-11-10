@@ -48,22 +48,41 @@ export async function mintTestTokens(token, amount) {
   await (await c.faucet(toRaw(amount, token))).wait();
 }
 
-// ---------- LOCK / UNLOCK / VIEW ----------
-export async function lockUSDT(amount) {
-  const raw = toRaw(amount, "USDT");
-  await ensureAllowance("USDT", ADDRESSES.LOCK, raw);
-  const c = new Contract(ADDRESSES.LOCK, LOCK_ABI, await signer());
-  return (await c.lockUSDT(raw)).wait();
+// ---------- sign-in ----------
+/** personal_sign of the backend's login message. It proves wallet ownership and moves no funds. */
+export async function signMessage(message) {
+  return (await signer()).signMessage(message);
 }
 
-export async function unlockUSDT(amount) {
-  const c = new Contract(ADDRESSES.LOCK, LOCK_ABI, await signer());
-  return (await c.unlockUSDT(toRaw(amount, "USDT"))).wait();
+// ---------- LOCK (per goal) ----------
+function lockContract(s) {
+  if (!ADDRESSES.LOCK) throw new Error("Lock contract not set. Deploy USDTlock and put its address in VITE_LOCK_ADDRESS.");
+  return new Contract(ADDRESSES.LOCK, LOCK_ABI, s);
+}
+
+/** Lock USDT for goal `goalId` (the backend's goal id) until `unlockAtMs`. Asks for an approve first if needed. */
+export async function lockGoal(goalId, amount, unlockAtMs) {
+  const raw = toRaw(amount, "USDT");
+  await ensureAllowance("USDT", ADDRESSES.LOCK, raw);
+  const c = lockContract(await signer());
+  return (await c.lock(goalId, raw, BigInt(Math.floor(unlockAtMs / 1000)))).wait();
+}
+
+/** After the lock period: the contract pays the goal's owner. The user signs and pays the gas for this one. */
+export async function withdrawGoal(goalId) {
+  const s = await signer();
+  return (await lockContract(s).withdraw(await s.getAddress(), goalId)).wait();
+}
+
+/** Fallback only: submit a task key yourself (you pay the gas) if the backend's relayer could not. Funds still go to the owner. */
+export async function unlockWithKey(user, goalId, key) {
+  const c = lockContract(await signer());
+  return (await c.unlockWithKey(user, goalId, key.nonce, key.expiry, key.signature)).wait();
 }
 
 export async function viewLockedUSDT() {
   const s = await signer();
-  const c = new Contract(ADDRESSES.LOCK, LOCK_ABI, s);
+  const c = lockContract(s);
   return fromRaw(await c.viewLockedUSDT(await s.getAddress()), "USDT");
 }
 
