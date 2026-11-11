@@ -56,12 +56,9 @@ const taskIn = (t) => ({ id: t.id, goalId: t.goal_id, category: t.category, at: 
 
 // ---- auth (wallet signature login) ----  
 export const getNonce = (address) => request('GET', `/auth/nonce?address=${encodeURIComponent(address)}`)
-
-export const login = (address, signature) =>
-  request('POST', '/auth/login', { addrs: address, signature })
-
+export const login = (address, signature) => request('POST', '/auth/login', { addrs: address, signature })
 export const createUser = ({ address, username, signature, nimAddress }) =>
-  request('POST', '/auth/create_user', { evm_addrs: address, username, signature, nim_address: nimAddress ?? null })
+  request('POST', '/auth/create_user', { evm_addrs: address, nim_addrs: nimAddress ?? '', username, signature, nim_address: nimAddress ?? null })
 export const me = () => request('GET', '/me')
 
 // ---- goals: create (pending) -> lock on-chain -> confirm (the backend reads the contract) ----

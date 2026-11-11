@@ -31,7 +31,7 @@ export default function ConnectWallet({ onBack, onConnected }) {
             created = await register({ address: wallet.evmAddress, signature: out.signature, username: randomUsername(), nimAddress: wallet.nimAddress })
             break
           } catch (err) {
-            if (i < 4 && (err.status === 409 || err.status === 422 || err.status === 400)) continue
+            if (i < 4 && err.status === 409 && /username/i.test(err.message)) continue // "username is taken"
             throw err
           }
         }
