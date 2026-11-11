@@ -2,7 +2,6 @@ import { useCallback, useEffect, useState } from 'react'
 import { Cpu, LayoutDashboard, RefreshCw, Settings, Target } from 'lucide-react'
 import { ThemeProvider } from '@/hooks/useTheme'
 import { AppProvider, useApp } from '@/context/AppContext'
-import { isTelegram, useTelegram } from '@/hooks/useTelegram'
 import { Logo } from '@/components/Logo'
 import { cn } from '@/lib/utils'
 import LaunchScreen from '@/screens/LaunchScreen'
@@ -95,7 +94,6 @@ function Flow() {
 }
 
 export default function App() {
-  useTelegram() // ready(), expand(), safe-area insets, header colours
   return (
  <ThemeProvider>
   <AppProvider>

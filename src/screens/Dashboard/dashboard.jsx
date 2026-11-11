@@ -151,7 +151,7 @@ export default function Dashboard({ onNavigate }) {
       {/* daily challenge
       <section>
         <SectionHead title="Daily challenge" />
-        <Card className="flex items-start gap-3 rounded-2xl border-primary/20 bg-primary/5 p-4">
+        <Card className="flex items-start gap-3 rounded-2xl border-priry/20 bg-primary/5 p-4">
           <span className="rounded-xl bg-primary p-2 text-white"><TaskIcon name={getCategory(dailyTask.category).icon} size={16} /></span>
           <div className="flex-1">
             <h4 className="text-sm font-bold">{dailyTask.title}</h4>
