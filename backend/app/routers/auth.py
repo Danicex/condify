@@ -26,9 +26,9 @@ from pydantic import BaseModel, StringConstraints
 from sqlmodel import select
 
 from app.database import SessionDep
-from app.model import AuthNonce, User, UserRead, utcnow
+from app.model import AuthNonce, User, UserRead, utcnow, as_utc
 from app.wallet import normalize_address, verify_signed_message
-
+# in _consume_challenge:
 router = APIRouter(prefix="/auth", tags=["auth"])
 bearer = HTTPBearer(auto_error=False)
 
@@ -131,7 +131,7 @@ def get_nonce(session: SessionDep, address: str = Query(...)):
 def _consume_challenge(session: SessionDep, address: str, signature: str) -> None:
     """Checks the signature against the stored challenge, then burns the nonce (single use). Raises 401 on any failure."""
     row = session.get(AuthNonce, address)
-    if not row or row.expires_at <= utcnow():
+    if not row or as_utc(row.expires_at) <= utcnow():
         raise HTTPException(401, "no valid challenge for this address, request a new nonce")
     if not verify_signed_message(address, row.message, signature):
         raise HTTPException(401, "invalid signature for this address")
@@ -152,7 +152,7 @@ class Login(BaseModel):
     addrs: str
     signature: Signature
 
-
+    
 class AuthOut(BaseModel):
     token: str
     user: UserRead
