@@ -12,7 +12,10 @@ from app.errors import ApiError
 from app.model import UserRead
 from app.routers import auth, goals, tasks
 from app.routers.data import routers
+from dotenv import load_dotenv
 
+# Load variables from the .env file into the environment
+load_dotenv()
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):

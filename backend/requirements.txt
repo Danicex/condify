@@ -9,3 +9,4 @@ eth-utils
 eth-account
 eth-abi
 httpx                     # only for tests
+python-dotenv
