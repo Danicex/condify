@@ -9,7 +9,6 @@ import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useApp } from '@/context/AppContext'
 
-
 const TYPE_META = {
   time: { icon: Clock, label: 'When', color: 'text-primary bg-primary/10' },
   api: { icon: Cpu, label: 'What', color: 'text-secondary bg-secondary/10 dark:text-accent dark:bg-accent/10' },
@@ -56,8 +55,8 @@ export default function ConditionWealthView() {
 
   const locate = () => {
     navigator.geolocation?.getCurrentPosition(
-      (p) => { setLat(p.coords.latitude.toFixed(5)); setLng(p.coords.longitude.toFixed(5));  },
-      () => alert("error"),
+      (p) => { setLat(p.coords.latitude.toFixed(5)); setLng(p.coords.longitude.toFixed(5)) },
+      () => {},
     )
   }
 

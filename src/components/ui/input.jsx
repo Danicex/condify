@@ -26,7 +26,7 @@ const Textarea = React.forwardRef(({ className, ...props }, ref) => (
 ))
 Textarea.displayName = 'Textarea'
 
-/* shadcn-styled native select (keeps the OS picker, which is best inside Telegram on mobile) */
+/* shadcn-styled native select (keeps the OS picker on mobile) */
 const Select = React.forwardRef(({ className, children, ...props }, ref) => (
   <select
     ref={ref}

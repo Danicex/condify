@@ -1,6 +1,6 @@
 import { cn } from '@/lib/utils'
 
-/** Nimlock mark: a lock-shackle arch framing a coin. */
+/** Condify mark: a lock-shackle arch framing a coin. */
 export function LogoMark({ className }) {
   return (
     <svg viewBox="0 0 64 64" className={cn('h-8 w-8', className)} fill="currentColor" aria-hidden>

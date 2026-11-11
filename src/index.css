@@ -4,7 +4,7 @@
 /* class-based dark mode: <html class="dark"> (driven by ThemeProvider / Settings) */
 @custom-variant dark (&:where(.dark, .dark *));
 
-/* ---------- Nimlock brand tokens ---------- */
+/* ---------- Condify brand tokens ---------- */
 :root {
   --background: #FFFBF4;          /* Warm Ivory */
   --foreground: #1C1C1E;          /* Dark Charcoal */
@@ -24,8 +24,6 @@
   --success: #10B981;
   --destructive: #EF4444;
   --radius: 1rem;
-  --tg-top: 0px;                  /* Telegram safe-area (set by useTelegram) */
-  --tg-bottom: 0px;
 }
 
 .dark {

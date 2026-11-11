@@ -1,15 +1,14 @@
-import { ArrowDownRight, ArrowRight, ArrowUpRight, Brain, Cpu, Flame, Lock, Plus, RefreshCw, Send, Target, Unlock, CheckCircle2 } from 'lucide-react'
+import { useState } from 'react'
+import { ArrowRight, Brain, Cpu, Flame, Lock, Plus, RefreshCw, Send, Target, Unlock, CheckCircle2 } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Progress } from '@/components/ui/progress'
-import TaskIcon from '@/components/TaskIcon'
 import { useApp } from '@/context/AppContext'
 import { useMarket } from '@/hooks/useMarket'
-import { TASKS, getCategory } from '@/data/task'
-import { DAY, fmtPrice, fmtUSD, shortAddr, cn } from '@/lib/utils'
+import { DAY, fmtUSD, shortAddr, cn } from '@/lib/utils'
 import { Link } from 'react-router-dom'
-const SYMBOLS = ['BTC', 'SOL', 'NIM']
+import { randomUsername } from '@/lib/username'
 const ICONS = { lock: Lock, unlock: Unlock, swap: RefreshCw, send: Send, task: Brain, rule: Cpu }
 
 const ago = (t) => {
@@ -21,14 +20,13 @@ const ago = (t) => {
 
 export default function Dashboard({ onNavigate }) {
   const { goals, conditions, activity, stats, wallet, balances } = useApp()
-  const user  = {}
+  const [guestName] = useState(randomUsername) // only used if the account has no name yet
   const market = useMarket()
   const active = goals.filter((g) => g.status === 'active')
   const now = Date.now()
   const ready = active.filter((g) => g.unlockAt <= now)
   const locked = active.filter((g) => g.unlockAt > now)
   const nextUnlock = [...locked].sort((a, b) => a.unlockAt - b.unlockAt)[0]
-  const dailyTask = TASKS[Math.floor(now / DAY) % TASKS.length]
   const armed = conditions.filter((c) => c.enabled).length
 
   // allocation from real balances (NIM valued at the live market price; locked USDT counted as USDT)
@@ -48,7 +46,7 @@ export default function Dashboard({ onNavigate }) {
       <div className="flex items-center justify-between">
         <div>
           <p className="text-xs font-medium text-muted-foreground">Welcome back</p>
-          <h2 className="text-xl font-extrabold tracking-tight">{wallet?.user?.username || user?.first_name || 'Saver'} 👋</h2>
+          <h2 className="text-xl font-extrabold tracking-tight">{wallet?.user?.username || guestName} 👋</h2>
         </div>
         {wallet && (
           <span className="flex items-center gap-1.5 rounded-full border bg-card px-3 py-1.5 font-mono text-[11px] font-bold">
@@ -147,18 +145,6 @@ export default function Dashboard({ onNavigate }) {
         </div>
       </section>
 
-      {/* daily challenge
-      <section>
-        <SectionHead title="Daily challenge" />
-        <Card className="flex items-start gap-3 rounded-2xl border-priry/20 bg-primary/5 p-4">
-          <span className="rounded-xl bg-primary p-2 text-white"><TaskIcon name={getCategory(dailyTask.category).icon} size={16} /></span>
-          <div className="flex-1">
-            <h4 className="text-sm font-bold">{dailyTask.title}</h4>
-            <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">{dailyTask.description} Keep your streak alive — pick this as a goal task to practise.</p>
-          </div>
-        </Card>
-      </section> */}
-
       {/* automations */}
       <Card className="flex items-center gap-3 rounded-2xl p-4">
         <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-secondary text-secondary-foreground"><Cpu size={18} /></span>
@@ -169,32 +155,7 @@ export default function Dashboard({ onNavigate }) {
         <button onClick={() => onNavigate('condition')} className="text-primary"><ArrowRight size={18} /></button>
       </Card>
 
-      {/* market (live, CoinGecko) + allocation (from real balances) */}
-      <section>
-        <SectionHead title="Market" />
-        <div className="grid grid-cols-2 gap-2">
-          {SYMBOLS.map((sym) => {
-            const m = market.prices?.[sym]
-            return (
-              <Card key={sym} className="rounded-2xl p-3">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-extrabold">{sym}</span>
-                  {m && (
-                    <span className={cn('flex items-center text-[11px] font-bold', m.c >= 0 ? 'text-success' : 'text-destructive')}>
-                      {m.c >= 0 ? <ArrowUpRight size={12} /> : <ArrowDownRight size={12} />}{Math.abs(m.c).toFixed(1)}%
-                    </span>
-                  )}
-                </div>
-                <p className="mt-1 font-mono text-sm font-bold">{m ? fmtPrice(m.p) : market.loading ? '…' : 'N/A'}</p>
-              </Card>
-            )
-          })}
-        </div>
-        <p className="mt-2 text-[10px] text-muted-foreground">
-          {market.error ? `Live prices unavailable: ${market.error}` : market.updatedAt ? `Live · CoinGecko · 24h change · updated ${new Date(market.updatedAt).toLocaleTimeString()}` : 'Loading live prices…'}
-        </p>
-      </section>
-
+      {/* allocation (from real balances) */}
       {ALLOC && (
         <section>
           <SectionHead title="Allocation" />

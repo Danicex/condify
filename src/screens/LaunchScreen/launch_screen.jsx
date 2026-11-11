@@ -25,14 +25,14 @@ export default function LaunchScreen({ onStart }) {
 
       <header
         className="relative z-10 px-6 pb-0"
-        style={{ paddingTop: 'calc(1.5rem + var(--tg-top))' }}
+        style={{ paddingTop: '1.5rem' }}
       >
         <Logo tone="light" />
       </header>
 
       <div
         className="relative z-10 mt-auto space-y-5 px-6"
-        style={{ paddingBottom: 'calc(1.75rem + var(--tg-bottom))' }}
+        style={{ paddingBottom: '1.75rem' }}
       >
         <div className="space-y-3">
           <span className="inline-flex items-center gap-1.5 rounded-full bg-white/15 px-3 py-1 text-[11px] font-bold backdrop-blur-md">

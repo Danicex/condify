@@ -1,11 +1,10 @@
-import { Bell, ChevronRight, History, LogOut, MapPin, Moon, Palette, Smartphone, Sun, Monitor, Send, Wallet } from 'lucide-react'
+import { Bell, ChevronRight, History, LogOut, MapPin, Moon, Palette, Sun, Monitor, Wallet } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { Switch } from '@/components/ui/switch'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import { useApp } from '@/context/AppContext'
 import { useTheme } from '@/hooks/useTheme'
-
 import { shortAddr, cn } from '@/lib/utils'
 import { inNimiqPay } from '@/lib/nimiq'
 import { CHAIN_ID_HEX } from '@/lib/config'
@@ -26,7 +25,7 @@ const Row = ({ icon: Icon, label, children, border = true }) => (
 export default function SettingsView({ onLogout }) {
   const { theme, setTheme, resolved } = useTheme()
   const { wallet, balances } = useApp()
-  const name = wallet.address
+  const name = wallet?.user?.username || 'Condify user'
 
   return (
     <div className="animate-fade-in space-y-5">
@@ -36,7 +35,6 @@ export default function SettingsView({ onLogout }) {
           <h4 className="truncate text-sm font-bold leading-none">{name}</h4>
           <p className="mt-1 font-mono text-[11px] text-muted-foreground">{wallet ? `${wallet.provider} · ${shortAddr(wallet.address.replace(/\s/g, ''))}` : 'No wallet'}</p>
         </div>
-        {isTelegram && <Send size={14} className="ml-auto text-[#229ED9]" />}
       </div>
 
       {/* THEME */}
@@ -49,7 +47,7 @@ export default function SettingsView({ onLogout }) {
             return (
               <button
                 key={t.id}
-                onClick={() => { setTheme(t.id); haptic.select() }}
+                onClick={() => { setTheme(t.id) }}
                 aria-pressed={active}
                 className={cn('rounded-2xl border-2 bg-card p-2 text-center transition-all active:scale-95', active ? 'border-primary shadow-md shadow-primary/10' : 'border-transparent')}
               >
@@ -64,14 +62,13 @@ export default function SettingsView({ onLogout }) {
           })}
         </div>
         <p className="text-[11px] text-muted-foreground">
-          {theme === 'system' ? `Following your ${isTelegram ? 'Telegram' : 'device'} setting (currently ${resolved}).` : `Using the ${theme} theme.`}
+          {theme === 'system' ? `Following your device setting (currently ${resolved}).` : `Using the ${theme} theme.`}
         </p>
       </section>
 
       <Card className="overflow-hidden rounded-3xl">
         <Row icon={Bell} label="Push notifications"><Switch defaultChecked /></Row>
-        <Row icon={MapPin} label="Geofencing tracking"><Switch /></Row>
-        <Row icon={Smartphone} label="Haptic feedback" border={false}><Switch defaultChecked /></Row>
+        <Row icon={MapPin} label="Geofencing tracking" border={false}><Switch /></Row>
       </Card>
 
       {/* WALLET DIAGNOSTICS: handy on a phone where there is no dev console */}

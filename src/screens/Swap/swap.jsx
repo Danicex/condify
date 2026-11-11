@@ -44,7 +44,7 @@ export default function SwapMatrixView() {
     return () => { cancelled = true; clearTimeout(t); setQuoting(false) }
   }, [amount, from, to, amt, live])
 
-  const flip = () => { setFrom(to); setTo(from); }
+  const flip = () => { setFrom(to); setTo(from) }
   const pick = (side, v) => { // keep from ≠ to
     if (side === 'from') { setFrom(v); if (v === to) setTo(TOKENS.find((t) => t !== v)) }
     else { setTo(v); if (v === from) setFrom(TOKENS.find((t) => t !== v)) }

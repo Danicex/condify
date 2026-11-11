@@ -1,5 +1,5 @@
 /**
- * HTTP client for the condify FastAPI backend.
+ * HTTP client for the Condify FastAPI backend.
  * Base URL: VITE_API_URL (e.g. http://localhost:8000).
  * Auth: setAuth({ token }) after the wallet-signature login (lib/auth.js). setAuth({ devAddress }) is the dev header
  * (backend needs AUTH_DEV_MODE=1, and it is only sent by dev builds).
@@ -19,10 +19,7 @@ const detailText = (d, status) => {
 }
 
 async function request(method, path, body) {
-  // ngrok's free tier answers browsers with a "Visit Site" warning page (no CORS headers, never reaches the backend,
-  // shows up as "Failed to fetch"). This header skips it. The backend ignores it.
-  const headers = { }
-  // const headers = { 'ngrok-skip-browser-warning': 'true' }
+  const headers = {}
   if (auth.token) headers.Authorization = `Bearer ${auth.token}`
   else if (import.meta.env.DEV && auth.devAddress) headers['X-Dev-Address'] = auth.devAddress
 
@@ -31,15 +28,7 @@ async function request(method, path, body) {
   else if (body !== undefined) { headers['Content-Type'] = 'application/json'; payload = JSON.stringify(body) }
 
   const hadToken = !!auth.token
-  let res
-  try {
-    res = await fetch(`${BASE}${path}`, { method, headers, body: payload })
-  } catch (e) {
-    // the browser only says "Failed to fetch" for DNS / TLS / CORS / blocked requests: name the URL so it can be debugged
-    const err = new Error(`Cannot reach the server at ${BASE}. Check VITE_API_URL, that the backend is running, and that CORS_ORIGINS includes ${window.location.origin}.`)
-    err.cause = e
-    throw err
-  }
+  const res = await fetch(`${BASE}${path}`, { method, headers, body: payload })
   if (!res.ok) {
     let detail = ''
     try { detail = (await res.json()).detail } catch { /* not json */ }

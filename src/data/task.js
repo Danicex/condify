@@ -1,5 +1,4 @@
 /**
- * Nimlock unlock tasks.
  *
  * When a user locks money for a goal they pick ONE task from this list. If they want to
  * liquidate (withdraw) BEFORE the lock duration ends, they must complete that task first.

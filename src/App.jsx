@@ -59,7 +59,7 @@ function Flow() {
   const current = TABS.find((t) => t.id === page) || { title: 'Send' }
   return (
     <div className="flex h-full flex-col">
-      <header className="flex shrink-0 items-center justify-between border-b bg-card px-5 pb-3" style={{ paddingTop: 'calc(0.75rem + var(--tg-top))' }}>
+      <header className="flex shrink-0 items-center justify-between border-b bg-card px-5 pb-3" style={{ paddingTop: '0.75rem' }}>
         {page === 'dashboard' ? <Logo /> : <h1 className="text-lg font-extrabold tracking-tight">{current.title}</h1>}
         <span className="h-2 w-2 animate-pulse rounded-full bg-success" title="Connected" />
       </header>
@@ -81,7 +81,7 @@ function Flow() {
         {page === 'settings' && <SettingsView onLogout={logout} />}
       </main>
 
-      <nav className="flex shrink-0 items-center justify-around border-t bg-card px-2 pt-2" style={{ paddingBottom: 'calc(0.5rem + var(--tg-bottom))' }}>
+      <nav className="flex shrink-0 items-center justify-around border-t bg-card px-2 pt-2" style={{ paddingBottom: '0.5rem' }}>
         {TABS.map(({ id, label, icon: Icon }) => (
           <button key={id} onClick={() => navigate(id)} className="flex w-16 flex-col items-center gap-0.5 py-1 transition-transform active:scale-90">
             <span className={cn('rounded-xl px-3 py-1 transition-colors', page === id ? 'bg-primary/10 text-primary' : 'text-muted-foreground')}><Icon size={21} /></span>
@@ -97,9 +97,9 @@ export default function App() {
   return (
  <ThemeProvider>
   <AppProvider>
-  {/* Inside Telegram the app fills the whole webview; in a browser it sits in a phone frame on large screens */}
-    <div className={cn('flex min-h-dvh items-center justify-center bg-background','sm:bg-muted sm:p-6')}>
-      <div className={cn('relative h-dvh w-full overflow-hidden bg-background text-foreground', 'sm:h-[min(900px,calc(100dvh-3rem))] sm:max-w-[430px] sm:rounded-[40px] sm:border sm:shadow-2xl')}>
+    {/* On large screens the app sits in a phone frame */}
+    <div className={'flex min-h-dvh items-center justify-center bg-background sm:bg-muted sm:p-6'}>
+      <div className={'relative h-dvh w-full overflow-hidden bg-background text-foreground sm:h-[min(900px,calc(100dvh-3rem))] sm:max-w-[430px] sm:rounded-[40px] sm:border sm:shadow-2xl'}>
         
         {/* Routes handle what dynamically renders inside the phone frame */}
         <Routes>

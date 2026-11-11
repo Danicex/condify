@@ -65,8 +65,7 @@ export default function AiTask({ goal, onPassed, onCancel }) {
     setPhase('checking'); setError(''); setVerdict(null)
     try {
       const res = await api.verifyTask(goal.id, { text: text.trim() || undefined, file })
-      if (res.passed) {  onPassedRef.current(res); return }
-     
+      if (res.passed) { onPassedRef.current(res); return }
       setTask((t) => ({ ...t, status: res.status, attempts: t.max_attempts - res.attempts_left }))
       setVerdict(res); setFile(null); setPhase('ready')
     } catch (e) {

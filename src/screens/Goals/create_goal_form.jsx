@@ -98,7 +98,7 @@ export default function CreateGoalForm({ onCancel, onDone }) {
         </div>
         <div className="space-y-2">
           {CATEGORIES.map((c) => (
-            <button type="button" key={c.id} onClick={() => { setCat(c.id); haptic.select() }} className="block w-full text-left">
+            <button type="button" key={c.id} onClick={() => { setCat(c.id) }} className="block w-full text-left">
               <Card className={cn('flex items-center gap-3 rounded-2xl p-3.5 transition-all', cat === c.id && 'border-primary bg-primary/5 ring-2 ring-primary/20')}>
                 <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-muted"><TaskIcon name={c.icon} size={17} /></span>
                 <div className="min-w-0 flex-1">
@@ -115,7 +115,7 @@ export default function CreateGoalForm({ onCancel, onDone }) {
             <button
               type="button"
               key={d.id}
-              onClick={() => { setDifficulty(d.id); haptic.select() }}
+              onClick={() => { setDifficulty(d.id) }}
               className={cn('flex-1 rounded-xl border px-3 py-2 text-center transition-all active:scale-95', difficulty === d.id ? 'border-primary bg-primary text-white' : 'bg-card')}
             >
               <span className="block text-xs font-bold">{d.label}</span>

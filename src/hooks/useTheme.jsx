@@ -1,12 +1,9 @@
 import { createContext, useContext, useEffect, useMemo, useState } from 'react'
 
-
 const ThemeCtx = createContext(null)
-const KEY = 'nimlock-theme'
+const KEY = 'condify-theme'
 
 const systemPref = () => {
-  const tgScheme = ""
-  if (tgScheme) return tgScheme
   return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
 }
 
@@ -17,15 +14,13 @@ export function ThemeProvider({ children }) {
   })
   const [sys, setSys] = useState(systemPref)
 
-  // follow OS / Telegram scheme changes
+  // follow OS scheme changes
   useEffect(() => {
     const mq = window.matchMedia?.('(prefers-color-scheme: dark)')
     const update = () => setSys(systemPref())
     mq?.addEventListener?.('change', update)
-    window.Telegram?.WebApp?.onEvent?.('themeChanged', update)
     return () => {
       mq?.removeEventListener?.('change', update)
-      window.Telegram?.WebApp?.offEvent?.('themeChanged', update)
     }
   }, [])
 
@@ -34,7 +29,6 @@ export function ThemeProvider({ children }) {
   useEffect(() => {
     document.documentElement.classList.toggle('dark', resolved === 'dark')
     document.documentElement.style.colorScheme = resolved
-    
     try { localStorage.setItem(KEY, theme) } catch { /* private mode */ }
   }, [theme, resolved])
 
