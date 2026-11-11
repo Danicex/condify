@@ -4,7 +4,6 @@ import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Input, Textarea } from '@/components/ui/input'
-import { haptic } from '@/hooks/useTelegram'
 import * as api from '@/lib/api'
 
 /**
@@ -66,12 +65,12 @@ export default function AiTask({ goal, onPassed, onCancel }) {
     setPhase('checking'); setError(''); setVerdict(null)
     try {
       const res = await api.verifyTask(goal.id, { text: text.trim() || undefined, file })
-      if (res.passed) { haptic.success(); onPassedRef.current(res); return }
-      haptic.error()
+      if (res.passed) {  onPassedRef.current(res); return }
+     
       setTask((t) => ({ ...t, status: res.status, attempts: t.max_attempts - res.attempts_left }))
       setVerdict(res); setFile(null); setPhase('ready')
     } catch (e) {
-      haptic.error(); setError(e.message || 'Could not check your proof'); setPhase('ready')
+      setError(e.message || 'Could not check your proof'); setPhase('ready')
     }
   }
 

@@ -5,7 +5,7 @@ import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import { useApp } from '@/context/AppContext'
 import { useTheme } from '@/hooks/useTheme'
-import { haptic, useTelegram } from '@/hooks/useTelegram'
+
 import { shortAddr, cn } from '@/lib/utils'
 import { inNimiqPay } from '@/lib/nimiq'
 import { CHAIN_ID_HEX } from '@/lib/config'
@@ -26,8 +26,7 @@ const Row = ({ icon: Icon, label, children, border = true }) => (
 export default function SettingsView({ onLogout }) {
   const { theme, setTheme, resolved } = useTheme()
   const { wallet, balances } = useApp()
-  const { user, isTelegram } = useTelegram()
-  const name = user ? [user.first_name, user.last_name].filter(Boolean).join(' ') : 'Condify user'
+  const name = wallet.address
 
   return (
     <div className="animate-fade-in space-y-5">

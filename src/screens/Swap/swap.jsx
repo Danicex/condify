@@ -4,7 +4,6 @@ import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { Input, Select } from '@/components/ui/input'
 import { useApp } from '@/context/AppContext'
-import { haptic } from '@/hooks/useTelegram'
 import { cn } from '@/lib/utils'
 import { quoteSwap, swapNIMforUSDT, swapUSDTforNIM } from '@/contracts'
 
@@ -45,7 +44,7 @@ export default function SwapMatrixView() {
     return () => { cancelled = true; clearTimeout(t); setQuoting(false) }
   }, [amount, from, to, amt, live])
 
-  const flip = () => { setFrom(to); setTo(from); haptic.select() }
+  const flip = () => { setFrom(to); setTo(from); }
   const pick = (side, v) => { // keep from ≠ to
     if (side === 'from') { setFrom(v); if (v === to) setTo(TOKENS.find((t) => t !== v)) }
     else { setTo(v); if (v === from) setFrom(TOKENS.find((t) => t !== v)) }
@@ -55,12 +54,10 @@ export default function SwapMatrixView() {
     setBusy(true); setError('')
     try {
       if (live) await (from === 'USDT' ? swapUSDTforNIM(amount) : swapNIMforUSDT(amount))
-      haptic.success()
       log('swap', `Swapped ${amount} ${from} → ${out != null ? out.toLocaleString(undefined, { maximumFractionDigits: 4 }) : ''} ${to}`.replace('  ', ' '))
       setDone(true); setAmount(''); setTimeout(() => setDone(false), 2200)
       balances.refresh()
     } catch (e) {
-      haptic.error()
       setError(e?.shortMessage || e?.reason || e?.message || 'Swap failed')
     } finally {
       setBusy(false)

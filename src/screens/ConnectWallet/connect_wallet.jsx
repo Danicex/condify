@@ -5,7 +5,6 @@ import { Input } from '@/components/ui/input'
 import { Logo } from '@/components/Logo'
 import { connectNimiqPay, demoWallet } from '@/lib/nimiq'
 import { register, signIn } from '@/lib/auth'
-import { haptic } from '@/hooks/useTelegram'
 
 const USERNAME_RE = /^[A-Za-z0-9_]{3,20}$/
 
@@ -34,7 +33,6 @@ export default function ConnectWallet({ onBack, onConnected }) {
         setState('username')
         return
       }
-      haptic.success()
       onConnected({ ...wallet, user: out.user })
     } catch (e) {
       if (e.message === 'NOT_IN_NIMIQ_PAY') setState('not-in-pay')
@@ -49,10 +47,8 @@ export default function ConnectWallet({ onBack, onConnected }) {
     const { wallet, signature } = pending.current
     try {
       const out = await register({ address: wallet.evmAddress, signature, username, nimAddress: wallet.nimAddress })
-      haptic.success()
       onConnected({ ...wallet, user: out.user })
     } catch (err) {
-      haptic.error()
       if (err.status === 401) { await connect() } // the 5-minute sign-in message expired: sign a fresh one
       else setMessage(err.message || 'Could not create your account')
     } finally {

@@ -5,7 +5,6 @@ import { Button } from '@/components/ui/button'
 import { Progress } from '@/components/ui/progress'
 import TaskIcon from '@/components/TaskIcon'
 import { useApp } from '@/context/AppContext'
-import { useTelegram } from '@/hooks/useTelegram'
 import { useMarket } from '@/hooks/useMarket'
 import { TASKS, getCategory } from '@/data/task'
 import { DAY, fmtPrice, fmtUSD, shortAddr, cn } from '@/lib/utils'
@@ -22,7 +21,7 @@ const ago = (t) => {
 
 export default function Dashboard({ onNavigate }) {
   const { goals, conditions, activity, stats, wallet, balances } = useApp()
-  const { user } = useTelegram()
+  const user  = {}
   const market = useMarket()
   const active = goals.filter((g) => g.status === 'active')
   const now = Date.now()

@@ -8,7 +8,6 @@ import TaskIcon from '@/components/TaskIcon'
 import { useApp } from '@/context/AppContext'
 import { CATEGORIES } from '@/data/task'
 import { DAY, cn, fmtUSD } from '@/lib/utils'
-import { haptic } from '@/hooks/useTelegram'
 
 const DURATIONS = [
   { d: 7, l: '1 week' },
@@ -47,10 +46,8 @@ export default function CreateGoalForm({ onCancel, onDone }) {
     setBusy(true); setError('')
     try {
       await addGoal({ name: name.trim(), amount: Number(amount), token, unlockAt: Date.now() + lockDays * DAY, taskCategory: cat, taskDifficulty: difficulty })
-      haptic.success()
       onDone()
     } catch (err) {
-      haptic.error()
       setError(err?.shortMessage || err?.reason || err?.message || 'Lock transaction failed')
       setBusy(false)
     }

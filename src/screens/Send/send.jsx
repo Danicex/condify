@@ -6,7 +6,6 @@ import { Card } from '@/components/ui/card'
 import { Input, Select } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { useApp } from '@/context/AppContext'
-import { haptic } from '@/hooks/useTelegram'
 import { shortAddr } from '@/lib/utils'
 import { sendNIM, sendUSDT } from '@/contracts'
 
@@ -30,12 +29,10 @@ export default function SendView() {
     setBusy(true); setError('')
     try {
       if (live) await (token === 'USDT' ? sendUSDT(to.trim(), amount) : sendNIM(to.trim(), amount))
-      haptic.success()
       log('send', `Sent ${amount} ${token} to ${shortAddr(to.trim())}`)
       setDone(true); setAmount(''); setTo(''); setTimeout(() => setDone(false), 2500)
       balances.refresh()
     } catch (err) {
-      haptic.error()
       setError(err?.shortMessage || err?.reason || err?.message || 'Transfer failed')
     } finally {
       setBusy(false)

@@ -6,7 +6,6 @@ import { Badge } from '@/components/ui/badge'
 import { Progress } from '@/components/ui/progress'
 import TaskIcon from '@/components/TaskIcon'
 import { useApp } from '@/context/AppContext'
-import { useTelegramBack } from '@/hooks/useTelegram'
 import { getCategory } from '@/data/task'
 import { DAY, fmtUSD } from '@/lib/utils'
 import CreateGoalForm from './create_goal_form'
@@ -22,7 +21,6 @@ export default function Goals({ initialView = 'list' }) {
   const [selectedId, setSelectedId] = useState(null)
 
   const back = useCallback(() => setView('list'), [])
-  useTelegramBack(view !== 'list', back)
 
   if (view === 'create') return <CreateGoalForm onCancel={back} onDone={back} />
   if (view === 'detail') {

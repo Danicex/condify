@@ -1,11 +1,11 @@
 import { createContext, useContext, useEffect, useMemo, useState } from 'react'
-import { syncTelegramColors, isTelegram } from './useTelegram'
+
 
 const ThemeCtx = createContext(null)
 const KEY = 'nimlock-theme'
 
 const systemPref = () => {
-  const tgScheme = isTelegram ? window.Telegram.WebApp.colorScheme : null
+  const tgScheme = ""
   if (tgScheme) return tgScheme
   return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
 }
@@ -34,7 +34,7 @@ export function ThemeProvider({ children }) {
   useEffect(() => {
     document.documentElement.classList.toggle('dark', resolved === 'dark')
     document.documentElement.style.colorScheme = resolved
-    syncTelegramColors(resolved === 'dark' ? '#121614' : '#FFFBF4')
+    
     try { localStorage.setItem(KEY, theme) } catch { /* private mode */ }
   }, [theme, resolved])
 

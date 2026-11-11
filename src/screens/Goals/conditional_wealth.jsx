@@ -8,7 +8,7 @@ import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useApp } from '@/context/AppContext'
-import { haptic } from '@/hooks/useTelegram'
+
 
 const TYPE_META = {
   time: { icon: Clock, label: 'When', color: 'text-primary bg-primary/10' },
@@ -56,8 +56,8 @@ export default function ConditionWealthView() {
 
   const locate = () => {
     navigator.geolocation?.getCurrentPosition(
-      (p) => { setLat(p.coords.latitude.toFixed(5)); setLng(p.coords.longitude.toFixed(5)); haptic.success() },
-      () => haptic.error(),
+      (p) => { setLat(p.coords.latitude.toFixed(5)); setLng(p.coords.longitude.toFixed(5));  },
+      () => alert("error"),
     )
   }
 
@@ -81,10 +81,8 @@ export default function ConditionWealthView() {
     setSaving(true); setSaveError('')
     try {
       await addCondition({ type, ...rule, action: actionText, config: { when, repeat, url, method, body, path, op, value, place, lat, lng, radius, edge, act, amount, target } })
-      haptic.success()
       setAmount('')
     } catch (err) {
-      haptic.error()
       setSaveError(err?.message || 'Could not save rule')
     } finally {
       setSaving(false)

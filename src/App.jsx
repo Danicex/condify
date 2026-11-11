@@ -97,9 +97,9 @@ export default function App() {
   return (
  <ThemeProvider>
   <AppProvider>
-    {/* Inside Telegram the app fills the whole webview; in a browser it sits in a phone frame on large screens */}
-    <div className={cn('flex min-h-dvh items-center justify-center bg-background', !isTelegram && 'sm:bg-muted sm:p-6')}>
-      <div className={cn('relative h-dvh w-full overflow-hidden bg-background text-foreground', !isTelegram && 'sm:h-[min(900px,calc(100dvh-3rem))] sm:max-w-[430px] sm:rounded-[40px] sm:border sm:shadow-2xl')}>
+  {/* Inside Telegram the app fills the whole webview; in a browser it sits in a phone frame on large screens */}
+    <div className={cn('flex min-h-dvh items-center justify-center bg-background','sm:bg-muted sm:p-6')}>
+      <div className={cn('relative h-dvh w-full overflow-hidden bg-background text-foreground', 'sm:h-[min(900px,calc(100dvh-3rem))] sm:max-w-[430px] sm:rounded-[40px] sm:border sm:shadow-2xl')}>
         
         {/* Routes handle what dynamically renders inside the phone frame */}
         <Routes>
