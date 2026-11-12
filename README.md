@@ -29,3 +29,6 @@ Testnet: long-press the Nimiq Pay settings button ~10 s → dev menu → Testnet
 `npm run dev` in a desktop browser shows a "continue with demo wallet" button (fake balances). It is not included in production builds.
 
 See `DUMMY_DATA.md` for everything that is still mock data.
+
+## License
+This project is licensed under the [MIT License](LICENSE).
